@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Syllabus Calendar</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <main class="container">
+        <header>
+            <h1>Syllabus Calendar Builder</h1>
+            <p>Upload a syllabus PDF or text file and we will pull out the due dates for you.</p>
+        </header>
+        {% if error %}
+            <div class="alert alert-error">{{ error }}</div>
+        {% endif %}
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        <section class="upload">
+            <form method="post" enctype="multipart/form-data">
+                <label for="syllabus">Choose a syllabus file (PDF or TXT)</label>
+                <input type="file" id="syllabus" name="syllabus" accept=".pdf,.txt" required>
+                <button type="submit">Extract Deadlines</button>
+            </form>
+        </section>
+        {% if grouped_events %}
+            <section class="actions">
+                <form action="{{ url_for('download_ics') }}" method="post">
+                    <button type="submit">Download ICS</button>
+                </form>
+            </section>
+            <section class="calendar">
+                {% for month, events in grouped_events.items() %}
+                    <article class="month-block">
+                        <h2>{{ month }}</h2>
+                        <ul>
+                            {% for event in events %}
+                                <li>
+                                    <div class="date">{{ event.date.strftime('%b %d, %Y') }}</div>
+                                    <div class="details">
+                                        <p>{{ event.description }}</p>
+                                        <a href="{{ event.google_link }}" target="_blank" rel="noopener">Add to Google Calendar</a>
+                                    </div>
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    </article>
+                {% endfor %}
+            </section>
+        {% endif %}
+    </main>
+</body>
+</html>
