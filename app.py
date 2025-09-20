@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Iterable
+import os
 
 from flask import (
     Flask,
@@ -23,6 +24,9 @@ except ModuleNotFoundError:  # pragma: no cover - handled at runtime
 app = Flask(__name__)
 app.secret_key = "replace-me"  # simple default; override in production
 
+# Track last AI classification diagnostics for the request/session
+_LAST_AI_DIAG: Dict[str, int] = {"attempts": 0, "used": 0, "failures": 0}
+
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -31,12 +35,24 @@ def index():
 
     if request.method == "POST":
         uploaded = request.files.get("syllabus")
+        # Persist AI mode preference from the form
+        session["use_ai"] = bool(request.form.get("use_ai"))
         if not uploaded or uploaded.filename == "":
             error = "Please choose a syllabus file to upload."
         else:
             try:
                 text = extract_text(uploaded)
-                due_dates = extract_due_dates(text)
+                use_ai = bool(session.get("use_ai", False))
+                due_dates = extract_due_dates(text, use_ai=use_ai)
+                # Save AI status for display
+                ai_diag = dict(_LAST_AI_DIAG)
+                if use_ai:
+                    if ai_diag.get("used", 0) > 0:
+                        session["ai_status"] = "active"
+                    else:
+                        session["ai_status"] = "heuristic"
+                else:
+                    session["ai_status"] = "off"
                 session["events"] = [
                     {"date": event["date"].isoformat(), "description": event["description"]}
                     for event in due_dates
@@ -61,7 +77,13 @@ def index():
 
     grouped = group_events_by_month(events)
 
-    return render_template("index.html", grouped_events=grouped, error=error)
+    return render_template(
+        "index.html",
+        grouped_events=grouped,
+        error=error,
+        use_ai=session.get("use_ai", False),
+        ai_status=session.get("ai_status", "off"),
+    )
 
 
 @app.route("/download-ics", methods=["POST"])
@@ -104,13 +126,17 @@ def extract_text(uploaded_file) -> str:
     return "\n".join(pages)
 
 
-def extract_due_dates(text: str) -> List[Dict[str, Any]]:
+def extract_due_dates(text: str, use_ai: bool | None = None) -> List[Dict[str, Any]]:
     """Parse the syllabus text and return detected due dates with descriptions."""
 
     lines = [" ".join(line.split()) for line in text.splitlines()]
     today = datetime.today().date()
     base_year = _infer_year(text, default_year=today.year)
     events: List[Dict[str, Any]] = []
+
+    # reset diagnostics
+    global _LAST_AI_DIAG
+    _LAST_AI_DIAG = {"attempts": 0, "used": 0, "failures": 0}
 
     for idx, line in enumerate(lines):
         if not line:
@@ -121,16 +147,30 @@ def extract_due_dates(text: str) -> List[Dict[str, Any]]:
             continue
 
         context = line
-        # If the current line is short, append the following line for more detail.
+        # If the current line is short, append the following line for more detail,
+        # but avoid pulling in citation/metadata-looking lines.
         if len(context) < 25 and idx + 1 < len(lines):
-            context = f"{context} {lines[idx + 1]}".strip()
+            nxt = lines[idx + 1]
+            if nxt and not _has_negative_citation_cues(nxt):
+                # Avoid merging if the next line itself contains a date token (likely a separate event)
+                has_date_in_next = any(True for _ in _find_date_matches(nxt))
+                if not has_date_in_next:
+                    context = f"{context} {nxt}".strip()
 
         for token in matches:
             parsed = _parse_date_token(token, today, base_year)
             if not parsed:
                 continue
 
+            # Use full context to decide if this looks like a real deadline
+            if not _looks_like_deadline(context, use_ai=use_ai, ai_diag=_LAST_AI_DIAG):
+                continue
+
             cleaned_description = _strip_token_from_context(token, context)
+            # Very short/empty descriptions without any deadline cues are likely not real
+            if len(cleaned_description.split()) <= 2 and not _has_positive_deadline_cues(context):
+                continue
+
             events.append({"date": parsed, "description": cleaned_description})
 
     # Deduplicate by date and description pair while preserving order
@@ -212,6 +252,197 @@ def _strip_token_from_context(token: str, context: str) -> str:
     return cleaned
 
 
+# ----- Heuristic and optional-AI classification to filter out non-deadlines -----
+
+_POSITIVE_KEYWORDS = [
+    "due",
+    "deadline",
+    "submit",
+    "submission",
+    "turn in",
+    "upload",
+    "deliver",
+    "deliverable",
+    "by",
+    "exam",
+    "test",
+    "quiz",
+    "midterm",
+    "final",
+    "assignment",
+    "homework",
+    "hw",
+    "project",
+    "paper",
+    "essay",
+    "lab",
+    "report",
+    "proposal",
+    "draft",
+    "milestone",
+    "checkpoint",
+    "presentation",
+    "gradescope",
+    "canvas",
+    "turnitin",
+]
+
+_NEGATIVE_KEYWORDS = [
+    "published",
+    "accessed",
+    "retrieved",
+    "copyright",
+    "isbn",
+    "doi",
+    "pp.",
+    "vol.",
+    "no.",
+    "edition",
+    "ed.",
+    "eds.",
+    "press",
+    "journal",
+    "proceedings",
+    "conference",
+    "arxiv",
+    "url",
+    "http",
+    "https",
+    "university press",
+    "oxford",
+    "cambridge",
+    "springer",
+    "wiley",
+    "sage",
+]
+
+_TIME_HINTS = [
+    r"\b11:?59\b",
+    r"\b(1[0-2]|0?[1-9]):[0-5][0-9]\s*(am|pm)\b",
+    r"\bmidnight\b",
+    r"\bnoon\b",
+]
+
+_MEETING_ONLY_HINTS = [
+    "lecture",
+    "class",
+    "topic",
+    "week ",
+    "session",
+]
+
+
+def _has_positive_deadline_cues(text: str) -> bool:
+    t = text.lower()
+    if any(k in t for k in _POSITIVE_KEYWORDS):
+        return True
+    for pat in _TIME_HINTS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _has_negative_citation_cues(text: str) -> bool:
+    t = text.lower()
+    if any(k in t for k in _NEGATIVE_KEYWORDS):
+        return True
+    # Common citation patterns: "Lastname (2015)", "(2015)" near author-like tokens
+    if re.search(r"\b[A-Z][A-Za-z\-]+\s*\(\d{4}\)", text):
+        return True
+    if re.search(r"\(\d{4}\)\s*[.;]?$", text):
+        return True
+    # Year alongside journal-like markers
+    if re.search(r"\b\d{4}\b.*\b(pp\.|doi|vol\.|no\.)", t):
+        return True
+    return False
+
+
+def _meeting_only_context(text: str) -> bool:
+    t = text.lower()
+    return any(h in t for h in _MEETING_ONLY_HINTS) and not _has_positive_deadline_cues(t)
+
+
+def _looks_like_deadline(context: str, use_ai: bool | None = None, ai_diag: Dict[str, int] | None = None) -> bool:
+    """Decide if a line/context with a date likely represents a deadline.
+
+    Strategy:
+    - If strong negative citation cues and no positive cues -> reject.
+    - If meeting-only phrasing without positive cues -> reject.
+    - Otherwise require some positive cues OR sufficiently descriptive text.
+    """
+    # Optional AI hook: enable via use_ai flag (preferred) or env var USE_AI_CLASSIFIER
+    if use_ai is None:
+        use_ai = bool(os.environ.get("USE_AI_CLASSIFIER"))
+    if use_ai:
+        try:
+            if ai_diag is not None:
+                ai_diag["attempts"] = ai_diag.get("attempts", 0) + 1
+            ans = _ai_says_deadline(context)
+            if isinstance(ans, bool):
+                if ai_diag is not None:
+                    ai_diag["used"] = ai_diag.get("used", 0) + 1
+                if ans is False:
+                    return False
+            # If ans is None, fall back to heuristics
+        except Exception:
+            if ai_diag is not None:
+                ai_diag["failures"] = ai_diag.get("failures", 0) + 1
+            # Fall back to heuristics if AI is unavailable/fails
+            pass
+
+    if _has_negative_citation_cues(context) and not _has_positive_deadline_cues(context):
+        return False
+    if _meeting_only_context(context):
+        return False
+
+    # Prefer lines that explicitly look like deliverables/exams or have time hints
+    if _has_positive_deadline_cues(context):
+        return True
+
+    # Otherwise, be conservative to avoid false positives from citations.
+    # Keep only if the non-date text is reasonably descriptive (>= 4 words)
+    words = [w for w in re.split(r"\s+", context.strip()) if w]
+    return len(words) >= 4
+
+
+def _ai_says_deadline(context: str) -> bool | None:
+    """Optional AI classifier. Returns True/False, or None on failure.
+
+    Requires: pip install openai, OPENAI_API_KEY, and USE_AI_CLASSIFIER=1.
+    """
+    try:
+        import openai  # type: ignore
+    except Exception:
+        return None
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    openai.api_key = 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
+    try:
+        prompt = (
+            "You classify a syllabus line as deadline or not. "
+            "Return only 'yes' or 'no'.\n\n"
+            f"Line: {context!r}\n"
+        )
+        # Minimal tokens; compatible with legacy clients. Adjust as needed.
+        resp = openai.Completion.create(
+            model=os.environ.get("OPENAI_DEADLINE_MODEL", "gpt-3.5-turbo-instruct"),
+            prompt=prompt,
+            max_tokens=1,
+            temperature=0,
+        )
+        text = resp.choices[0].text.strip().lower()
+        if text.startswith("y"):
+            return True
+        if text.startswith("n"):
+            return False
+    except Exception:
+        return None
+    return None
+
+
 def _infer_year(text: str, default_year: int) -> int:
     """Infer the intended syllabus year from the document text.
 
@@ -219,11 +450,18 @@ def _infer_year(text: str, default_year: int) -> int:
     - Look for explicit 4-digit years (2000–2100) and pick the most frequent.
     - On ties or no matches, fall back to the provided default_year.
     """
-    years = [int(y) for y in re.findall(r"\b(20\d{2}|19\d{2})\b", text)]
+    # Prefer years found on non-citation lines to avoid bias from references
+    lines = text.splitlines()
+    candidate_years: list[int] = []
+    for ln in lines:
+        if _has_negative_citation_cues(ln):
+            continue
+        candidate_years.extend(int(y) for y in re.findall(r"\b(20\d{2}|19\d{2})\b", ln))
+
+    years = candidate_years or [int(y) for y in re.findall(r"\b(20\d{2}|19\d{2})\b", text)]
     if not years:
         return default_year
 
-    # Tally occurrences
     counts: dict[int, int] = {}
     for y in years:
         if 2000 <= y <= 2100:

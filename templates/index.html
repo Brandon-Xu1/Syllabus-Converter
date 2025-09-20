@@ -26,6 +26,24 @@
             <form method="post" enctype="multipart/form-data">
                 <label for="syllabus">Choose a syllabus file (PDF or TXT)</label>
                 <input type="file" id="syllabus" name="syllabus" accept=".pdf,.txt" required>
+                <div class="options">
+                    <label class="checkbox">
+                        <input type="checkbox" name="use_ai" value="1" {% if use_ai %}checked{% endif %}>
+                        Use AI Mode (beta)
+                    </label>
+                    <p class="help">
+                        AI Mode sends each line to a lightweight classifier to decide if a date is a real deadline (e.g., due, submit, exam) or a citation/reading reference. It reduces false positives but may skip borderline items. Disabled by default.
+                    </p>
+                    <div class="ai-indicator">
+                        {% if ai_status == 'active' %}
+                            <div class="alert alert-success">AI Mode: Active (classifier used)</div>
+                        {% elif ai_status == 'heuristic' and use_ai %}
+                            <div class="alert alert-warning">AI Mode: On (heuristics used — AI unavailable)</div>
+                        {% else %}
+                            <div class="alert">AI Mode: Off</div>
+                        {% endif %}
+                    </div>
+                </div>
                 <button type="submit">Extract Deadlines</button>
             </form>
         </section>
