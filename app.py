@@ -66,14 +66,9 @@ def index():
                 error = "We couldn't read that file. Make sure it is a standard, text-based PDF."
 
     else:
-        stored = session.get("events", [])
-        if stored:
-            events = add_calendar_links(
-                [
-                    {"date": datetime.fromisoformat(item["date"]), "description": item["description"]}
-                    for item in stored
-                ]
-            )
+        # Reset UI to original state on refresh/open by clearing transient session state
+        for key in ("events", "use_ai", "ai_status"):
+            session.pop(key, None)
 
     grouped = group_events_by_month(events)
 
@@ -419,7 +414,7 @@ def _ai_says_deadline(context: str) -> bool | None:
     if not api_key:
         return None
 
-    openai.api_key = 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
+    openai.api_key = "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"
     try:
         prompt = (
             "You classify a syllabus line as deadline or not. "
