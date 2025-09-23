@@ -120,6 +120,20 @@ def extract_text(uploaded_file) -> str:
         pages.append(text)
     return "\n".join(pages)
 
+_URL_RE = re.compile(r'https?://', re.I)
+
+def _has_url(text: str) -> bool:
+    return bool(_URL_RE.search(text))
+
+def _in_plausible_academic_window(d: datetime, base_year: int) -> bool:
+    """Accept only dates near the inferred term (default: same year +/- 1)."""
+    return (base_year - 1) <= d.year <= (base_year + 1)
+
+def _looks_like_historical_year(d: datetime) -> bool:
+    """Hard reject obviously historical years (tune as needed)."""
+    return d.year < 1990
+
+
 
 def extract_due_dates(text: str, use_ai: bool | None = None) -> List[Dict[str, Any]]:
     """Parse the syllabus text and return detected due dates with descriptions."""
@@ -151,13 +165,26 @@ def extract_due_dates(text: str, use_ai: bool | None = None) -> List[Dict[str, A
                 has_date_in_next = any(True for _ in _find_date_matches(nxt))
                 if not has_date_in_next:
                     context = f"{context} {nxt}".strip()
-
+        
         for token in matches:
             parsed = _parse_date_token(token, today, base_year)
             if not parsed:
                 continue
 
-            # Use full context to decide if this looks like a real deadline
+            # 1) reject obviously historical dates
+            if _looks_like_historical_year(parsed):
+                continue
+
+            has_positive = _has_positive_deadline_cues(context)
+
+            # 2) if date is outside the term window (base_year ± 1) and no positive cue, skip
+            if not _in_plausible_academic_window(parsed, base_year) and not has_positive:
+                continue
+
+            # 3) if the line looks like a citation or has a URL and no positive cue, skip
+            if (_has_negative_citation_cues(context) or _has_url(context)) and not has_positive:
+                continue
+
             if not _looks_like_deadline(context, use_ai=use_ai, ai_diag=_LAST_AI_DIAG):
                 continue
 
@@ -167,6 +194,7 @@ def extract_due_dates(text: str, use_ai: bool | None = None) -> List[Dict[str, A
                 continue
 
             events.append({"date": parsed, "description": cleaned_description})
+
 
     # Deduplicate by date and description pair while preserving order
     seen = set()
@@ -188,6 +216,7 @@ _DATE_PATTERNS = (
     r"\b\d{4}-\d{1,2}-\d{1,2}\b",
 )
 _DATE_REGEXES = [re.compile(pattern, re.IGNORECASE) for pattern in _DATE_PATTERNS]
+
 
 
 def _find_date_matches(line: str) -> Iterable[str]:
@@ -258,7 +287,6 @@ _POSITIVE_KEYWORDS = [
     "upload",
     "deliver",
     "deliverable",
-    "by",
     "exam",
     "test",
     "quiz",
@@ -317,6 +345,18 @@ _TIME_HINTS = [
     r"\bmidnight\b",
     r"\bnoon\b",
 ]
+_BY_TIME_RE = re.compile(
+    r"\bby\s+(?:11:?59|midnight|noon|(?:1[0-2]|0?[1-9]):[0-5][0-9]\s*(?:am|pm))\b", 
+    re.I
+)
+
+_BY_DATE_RE = re.compile(
+    rf"\bby\s+(?:{_MONTHS_PATTERN}\s+\d{{1,2}}(?:,\s*\d{{4}})?|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\b", 
+    re.I
+)
+
+_DUE_BY_RE = re.compile(r"\bdue\s+by\b", re.I)
+
 
 _MEETING_ONLY_HINTS = [
     "lecture",
@@ -331,6 +371,10 @@ def _has_positive_deadline_cues(text: str) -> bool:
     t = text.lower()
     if any(k in t for k in _POSITIVE_KEYWORDS):
         return True
+    # “due by …” or “by <time/date>”
+    if _DUE_BY_RE.search(t) or _BY_TIME_RE.search(t) or _BY_DATE_RE.search(t):
+        return True
+    # explicit time hints also count
     for pat in _TIME_HINTS:
         if re.search(pat, t, flags=re.IGNORECASE):
             return True
@@ -528,4 +572,4 @@ def _escape_ics_text(value: str) -> str:
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    pass
