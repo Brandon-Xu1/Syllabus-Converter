@@ -88,6 +88,14 @@ header p {
     padding: 0.55rem 0.9rem;
 }
 
+/* Shown when a term is selected to set custom month range */
+.upload .term-range-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    flex-wrap: wrap;
+}
+
 label {
     font-weight: 600;
 }

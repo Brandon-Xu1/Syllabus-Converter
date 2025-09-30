@@ -30,14 +30,48 @@
                     <input type="file" id="syllabus" name="syllabus" accept=".pdf,.txt" required>
                 </div>
                 <label>Term:</label>
-                <select name="semester">
+                <select name="semester" id="semester">
                     <option value="" {% if not request.form.get('semester') %}selected{% endif %}>(auto)</option>
-                    <option value="fall"   {% if request.form.get('semester')=='fall' %}selected{% endif %}>Fall (Aug–Dec)</option>
-                    <option value="spring" {% if request.form.get('semester')=='spring' %}selected{% endif %}>Spring (Jan–May)</option>
-                    <option value="summer" {% if request.form.get('semester')=='summer' %}selected{% endif %}>Summer (May–Aug)</option>
+                    <option value="fall"   {% if request.form.get('semester')=='fall' %}selected{% endif %}>Fall</option>
+                    <option value="spring" {% if request.form.get('semester')=='spring' %}selected{% endif %}>Spring</option>
+                    <option value="summer" {% if request.form.get('semester')=='summer' %}selected{% endif %}>Summer</option>
                 </select>
                 <label>Year:</label>
                 <input name="year" type="number" min="2000" max="2100" value="{{ request.form.get('year','') }}" placeholder="2025" />
+                <div class="term-range-row" id="term-range-row" {% if not request.form.get('semester') %}style="display:none"{% endif %}>
+                    <label for="start_month">Start month:</label>
+                    <select name="start_month" id="start_month">
+                        <option value="" {% if not request.form.get('start_month') %}selected{% endif %}>(auto)</option>
+                        <option value="1"  {% if request.form.get('start_month')=='1' %}selected{% endif %}>January</option>
+                        <option value="2"  {% if request.form.get('start_month')=='2' %}selected{% endif %}>February</option>
+                        <option value="3"  {% if request.form.get('start_month')=='3' %}selected{% endif %}>March</option>
+                        <option value="4"  {% if request.form.get('start_month')=='4' %}selected{% endif %}>April</option>
+                        <option value="5"  {% if request.form.get('start_month')=='5' %}selected{% endif %}>May</option>
+                        <option value="6"  {% if request.form.get('start_month')=='6' %}selected{% endif %}>June</option>
+                        <option value="7"  {% if request.form.get('start_month')=='7' %}selected{% endif %}>July</option>
+                        <option value="8"  {% if request.form.get('start_month')=='8' %}selected{% endif %}>August</option>
+                        <option value="9"  {% if request.form.get('start_month')=='9' %}selected{% endif %}>September</option>
+                        <option value="10" {% if request.form.get('start_month')=='10' %}selected{% endif %}>October</option>
+                        <option value="11" {% if request.form.get('start_month')=='11' %}selected{% endif %}>November</option>
+                        <option value="12" {% if request.form.get('start_month')=='12' %}selected{% endif %}>December</option>
+                    </select>
+                    <label for="end_month">End month:</label>
+                    <select name="end_month" id="end_month">
+                        <option value="" {% if not request.form.get('end_month') %}selected{% endif %}>(auto)</option>
+                        <option value="1"  {% if request.form.get('end_month')=='1' %}selected{% endif %}>January</option>
+                        <option value="2"  {% if request.form.get('end_month')=='2' %}selected{% endif %}>February</option>
+                        <option value="3"  {% if request.form.get('end_month')=='3' %}selected{% endif %}>March</option>
+                        <option value="4"  {% if request.form.get('end_month')=='4' %}selected{% endif %}>April</option>
+                        <option value="5"  {% if request.form.get('end_month')=='5' %}selected{% endif %}>May</option>
+                        <option value="6"  {% if request.form.get('end_month')=='6' %}selected{% endif %}>June</option>
+                        <option value="7"  {% if request.form.get('end_month')=='7' %}selected{% endif %}>July</option>
+                        <option value="8"  {% if request.form.get('end_month')=='8' %}selected{% endif %}>August</option>
+                        <option value="9"  {% if request.form.get('end_month')=='9' %}selected{% endif %}>September</option>
+                        <option value="10" {% if request.form.get('end_month')=='10' %}selected{% endif %}>October</option>
+                        <option value="11" {% if request.form.get('end_month')=='11' %}selected{% endif %}>November</option>
+                        <option value="12" {% if request.form.get('end_month')=='12' %}selected{% endif %}>December</option>
+                    </select>
+                </div>
                 <button type="submit">Extract Deadlines</button>
             </form>
         </section>
@@ -80,6 +114,15 @@
                         nameSpan.textContent = 'No file chosen';
                     }
                 });
+            }
+            const semSelect = document.getElementById('semester');
+            const termRange = document.getElementById('term-range-row');
+            if (semSelect && termRange) {
+                const sync = () => {
+                    termRange.style.display = semSelect.value ? '' : 'none';
+                };
+                semSelect.addEventListener('change', sync);
+                sync();
             }
         });
     </script>

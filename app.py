@@ -44,11 +44,18 @@ def index():
                 semester = (request.form.get("semester") or "").strip() or None
                 year_str = (request.form.get("year") or "").strip()
                 year = int(year_str) if year_str.isdigit() else None
+                sm_str = (request.form.get("start_month") or "").strip()
+                em_str = (request.form.get("end_month") or "").strip()
+                start_month = int(sm_str) if sm_str.isdigit() else None
+                end_month = int(em_str) if em_str.isdigit() else None
 
                 text = extract_text(uploaded)
                 use_ai = bool(session.get("use_ai", False))
                 base_year = _infer_year(text, default_year=datetime.today().year)
-                sem_window = semester_window_from_choice(semester, year or base_year)
+                if semester and start_month and end_month:
+                    sem_window = (start_month, end_month, (year or base_year))
+                else:
+                    sem_window = semester_window_from_choice(semester, year or base_year)
 
                 due_dates = extract_due_dates(
                     text,
