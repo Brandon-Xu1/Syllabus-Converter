@@ -41,9 +41,21 @@ def index():
             error = "Please choose a syllabus file to upload."
         else:
             try:
+                semester = (request.form.get("semester") or "").strip() or None
+                year_str = (request.form.get("year") or "").strip()
+                year = int(year_str) if year_str.isdigit() else None
+
                 text = extract_text(uploaded)
                 use_ai = bool(session.get("use_ai", False))
-                due_dates = extract_due_dates(text, use_ai=use_ai)
+                base_year = _infer_year(text, default_year=datetime.today().year)
+                sem_window = semester_window_from_choice(semester, year or base_year)
+
+                due_dates = extract_due_dates(
+                    text,
+                    use_ai=use_ai,
+                    semester_window=sem_window,
+                    base_year_override=base_year,
+                )
                 # Save AI status for display
                 ai_diag = dict(_LAST_AI_DIAG)
                 if use_ai:
@@ -135,12 +147,13 @@ def _looks_like_historical_year(d: datetime) -> bool:
 
 
 
-def extract_due_dates(text: str, use_ai: bool | None = None) -> List[Dict[str, Any]]:
+def extract_due_dates(text: str, use_ai: bool | None = None,
+                      semester_window=None, base_year_override: int | None = None) -> List[Dict[str, Any]]:
     """Parse the syllabus text and return detected due dates with descriptions."""
 
     lines = [" ".join(line.split()) for line in text.splitlines()]
     today = datetime.today().date()
-    base_year = _infer_year(text, default_year=today.year)
+    base_year = base_year_override or _infer_year(text, default_year=today.year)
     events: List[Dict[str, Any]] = []
 
     # reset diagnostics
@@ -176,6 +189,10 @@ def extract_due_dates(text: str, use_ai: bool | None = None) -> List[Dict[str, A
                 continue
 
             has_positive = _has_positive_deadline_cues(context)
+
+            # If a semester window is provided, enforce it unless there is a strong positive cue
+            if semester_window and not in_semester_window(parsed, semester_window) and not has_positive:
+                continue
 
             # 2) if date is outside the term window (base_year ± 1) and no positive cue, skip
             if not _in_plausible_academic_window(parsed, base_year) and not has_positive:
@@ -217,6 +234,25 @@ _DATE_PATTERNS = (
 )
 _DATE_REGEXES = [re.compile(pattern, re.IGNORECASE) for pattern in _DATE_PATTERNS]
 
+
+def semester_window_from_choice(semester: str | None, year: int | None):
+    if not semester or not year:
+        return None
+    s = semester.lower()
+    if s == "fall":
+        return (8, 12, year)
+    if s == "spring":
+        return (1, 5, year)
+    if s == "summer":
+        return (5, 8, year)  # adjust if your school differs
+    return None
+
+
+def in_semester_window(dt: datetime, window) -> bool:
+    if not window:
+        return True
+    m1, m2, y = window
+    return (dt.year == y) and (m1 <= dt.month <= m2)
 
 
 def _find_date_matches(line: str) -> Iterable[str]:
@@ -337,6 +373,10 @@ _NEGATIVE_KEYWORDS = [
     "springer",
     "wiley",
     "sage",
+    "financial times",
+    "new york times",
+    "washington post",
+    "wall street journal",
 ]
 
 _TIME_HINTS = [
@@ -432,6 +472,10 @@ def _looks_like_deadline(context: str, use_ai: bool | None = None, ai_diag: Dict
     if _has_negative_citation_cues(context) and not _has_positive_deadline_cues(context):
         return False
     if _meeting_only_context(context):
+        return False
+    # Reject citation-tail dates like ", Month Day, Year" when there are no positive cues
+    if re.search(rf",\s*{_MONTHS_PATTERN}\s+\d{{1,2}},\s*\d{{4}}\b", context, flags=re.IGNORECASE) \
+            and not _has_positive_deadline_cues(context):
         return False
 
     # Prefer lines that explicitly look like deliverables/exams or have time hints

@@ -3,14 +3,14 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Syllabus Calendar</title>
+    <title>MySyllabus</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <main class="container">
         <header>
-            <h1>Syllabus Calendar Builder</h1>
-            <p>Upload a syllabus PDF or text file and we will pull out the due dates for you.</p>
+            <h1>MySyllabus</h1>
+            <p>Upload a PDF or text file and we will pull out the due dates for you.</p>
         </header>
         {% if error %}
             <div class="alert alert-error">{{ error }}</div>
@@ -24,8 +24,20 @@
         {% endwith %}
         <section class="upload">
             <form method="post" enctype="multipart/form-data">
-                <label for="syllabus">Choose a syllabus file (PDF or TXT)</label>
-                <input type="file" id="syllabus" name="syllabus" accept=".pdf,.txt" required>
+                <div class="file-control">
+                    <label for="syllabus">Choose a file (PDF or TXT)</label>
+                    <span id="syllabus-file-name" class="file-name" aria-live="polite">No file chosen</span>
+                    <input type="file" id="syllabus" name="syllabus" accept=".pdf,.txt" required>
+                </div>
+                <label>Term:</label>
+                <select name="semester">
+                    <option value="" {% if not request.form.get('semester') %}selected{% endif %}>(auto)</option>
+                    <option value="fall"   {% if request.form.get('semester')=='fall' %}selected{% endif %}>Fall (Aug–Dec)</option>
+                    <option value="spring" {% if request.form.get('semester')=='spring' %}selected{% endif %}>Spring (Jan–May)</option>
+                    <option value="summer" {% if request.form.get('semester')=='summer' %}selected{% endif %}>Summer (May–Aug)</option>
+                </select>
+                <label>Year:</label>
+                <input name="year" type="number" min="2000" max="2100" value="{{ request.form.get('year','') }}" placeholder="2025" />
                 <button type="submit">Extract Deadlines</button>
             </form>
         </section>
@@ -55,5 +67,21 @@
             </section>
         {% endif %}
     </main>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const input = document.getElementById('syllabus');
+            const nameSpan = document.getElementById('syllabus-file-name');
+            if (input && nameSpan) {
+                input.addEventListener('change', function () {
+                    const files = input.files;
+                    if (files && files.length > 0) {
+                        nameSpan.textContent = files.length === 1 ? files[0].name : files.length + ' files selected';
+                    } else {
+                        nameSpan.textContent = 'No file chosen';
+                    }
+                });
+            }
+        });
+    </script>
 </body>
 </html>
