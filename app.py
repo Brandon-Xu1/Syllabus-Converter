@@ -62,6 +62,8 @@ def index():
                     use_ai=use_ai,
                     semester_window=sem_window,
                     base_year_override=base_year,
+                    semester_choice=semester,
+                    year_choice=year or base_year,
                 )
                 # Save AI status for display
                 ai_diag = dict(_LAST_AI_DIAG)
@@ -155,7 +157,8 @@ def _looks_like_historical_year(d: datetime) -> bool:
 
 
 def extract_due_dates(text: str, use_ai: bool | None = None,
-                      semester_window=None, base_year_override: int | None = None) -> List[Dict[str, Any]]:
+                      semester_window=None, base_year_override: int | None = None,
+                      semester_choice: str | None = None, year_choice: int | None = None) -> List[Dict[str, Any]]:
     """Parse the syllabus text and return detected due dates with descriptions."""
 
     lines = [" ".join(line.split()) for line in text.splitlines()]
@@ -195,10 +198,21 @@ def extract_due_dates(text: str, use_ai: bool | None = None,
             if _looks_like_historical_year(parsed):
                 continue
 
+            # If we have a custom semester window that wraps (e.g., Aug–Jan) and
+            # the token had no explicit year, shift months before start into base_year+1
+            if semester_window:
+                m1, m2, _y = semester_window
+                if m2 < m1 and not _token_has_year(token):
+                    parsed = parsed.replace(year=(base_year if parsed.month >= m1 else base_year + 1))
+
             has_positive = _has_positive_deadline_cues(context)
 
-            # If a semester window is provided, enforce it unless there is a strong positive cue
-            if semester_window and not in_semester_window(parsed, semester_window) and not has_positive:
+            # Strictly enforce selected semester season if provided
+            if semester_choice and year_choice and not in_semester_window(parsed, semester_choice, year_choice):
+                continue
+
+            # If a custom month window is provided (advanced), enforce it strictly
+            if semester_window and not in_semester_window_window(parsed, semester_window):
                 continue
 
             # 2) if date is outside the term window (base_year ± 1) and no positive cue, skip
@@ -251,15 +265,40 @@ def semester_window_from_choice(semester: str | None, year: int | None):
     if s == "spring":
         return (1, 5, year)
     if s == "summer":
-        return (5, 8, year)  # adjust if your school differs
+        return (6, 7, year)  # Summer per spec
     return None
 
 
-def in_semester_window(dt: datetime, window) -> bool:
+def in_semester_window_window(dt: datetime, window) -> bool:
     if not window:
         return True
     m1, m2, y = window
-    return (dt.year == y) and (m1 <= dt.month <= m2)
+    if m1 <= m2:
+        return (dt.year == y) and (m1 <= dt.month <= m2)
+    # Wrapping window (e.g., Aug–Jan): accept months >= m1 in year y, and months <= m2 in year y+1
+    return (dt.year == y and dt.month >= m1) or (dt.year == y + 1 and dt.month <= m2)
+
+
+def in_semester_window(date_obj: datetime, semester: str | None, year: int | None) -> bool:
+    """Return True if date_obj is within the seasonal semester window for the given year.
+
+    Fall:   months 8–12
+    Spring: months 1–5
+    Summer: months 6–7
+    If semester or year is not provided/unrecognized, allow (return True).
+    """
+    if not semester or not year:
+        return True
+    s = semester.lower()
+    if s == "fall":
+        m1, m2 = 8, 12
+    elif s == "spring":
+        m1, m2 = 1, 5
+    elif s == "summer":
+        m1, m2 = 6, 7
+    else:
+        return True
+    return (date_obj.year == year) and (m1 <= date_obj.month <= m2)
 
 
 def _find_date_matches(line: str) -> Iterable[str]:
@@ -317,6 +356,19 @@ def _strip_token_from_context(token: str, context: str) -> str:
     if not cleaned:
         cleaned = "Due"
     return cleaned
+
+
+def _token_has_year(token: str) -> bool:
+    """Best-effort check whether the date token explicitly contains a year."""
+    if re.search(r"\b\d{4}\b", token):
+        return True
+    # numeric with year: 1/2/23 or 01-02-2024
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", token):
+        return True
+    # Month Day, Year
+    if re.search(rf"{_MONTHS_PATTERN}\s+\d{{1,2}},\s*\d{{4}}\b", token, flags=re.IGNORECASE):
+        return True
+    return False
 
 
 # ----- Heuristic and optional-AI classification to filter out non-deadlines -----
