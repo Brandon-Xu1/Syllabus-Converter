@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from dateutil import parser as dparser
 import re
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Iterable
+from typing import List, Dict, Any
+import json
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env or your environment.")
+
 
 from flask import (
     Flask,
@@ -24,8 +33,7 @@ except ModuleNotFoundError:  # pragma: no cover - handled at runtime
 app = Flask(__name__)
 app.secret_key = "replace-me"  # simple default; override in production
 
-# Track last AI classification diagnostics for the request/session
-_LAST_AI_DIAG: Dict[str, int] = {"attempts": 0, "used": 0, "failures": 0}
+# Using ChatGPT for extraction; no heuristic diagnostics needed
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -50,30 +58,10 @@ def index():
                 end_month = int(em_str) if em_str.isdigit() else None
 
                 text = extract_text(uploaded)
-                use_ai = bool(session.get("use_ai", False))
-                base_year = _infer_year(text, default_year=datetime.today().year)
-                if semester and start_month and end_month:
-                    sem_window = (start_month, end_month, (year or base_year))
-                else:
-                    sem_window = semester_window_from_choice(semester, year or base_year)
-
-                due_dates = extract_due_dates(
-                    text,
-                    use_ai=use_ai,
-                    semester_window=sem_window,
-                    base_year_override=base_year,
-                    semester_choice=semester,
-                    year_choice=year or base_year,
-                )
-                # Save AI status for display
-                ai_diag = dict(_LAST_AI_DIAG)
-                if use_ai:
-                    if ai_diag.get("used", 0) > 0:
-                        session["ai_status"] = "active"
-                    else:
-                        session["ai_status"] = "heuristic"
-                else:
-                    session["ai_status"] = "off"
+                print("PDF text chars:", len(text))
+                print("PDF preview:", text[:300].replace("\n"," "))
+                due_dates = extract_due_dates(text)
+                session["ai_status"] = "active"
                 session["events"] = [
                     {"date": event["date"].isoformat(), "description": event["description"]}
                     for event in due_dates
@@ -156,219 +144,66 @@ def _looks_like_historical_year(d: datetime) -> bool:
 
 
 
-def extract_due_dates(text: str, use_ai: bool | None = None,
-                      semester_window=None, base_year_override: int | None = None,
-                      semester_choice: str | None = None, year_choice: int | None = None) -> List[Dict[str, Any]]:
-    """Parse the syllabus text and return detected due dates with descriptions."""
+def extract_due_dates(text: str) -> List[Dict[str, Any]]:
+    """Use ChatGPT to extract due dates from the syllabus text.
 
-    lines = [" ".join(line.split()) for line in text.splitlines()]
-    today = datetime.today().date()
-    base_year = base_year_override or _infer_year(text, default_year=today.year)
+    Returns a list of dicts: {"date": datetime, "description": str}
+    """
+    # Debug: ensure PDF gave us real text
+    print("PDF text chars:", len(text))
+
+    raw_items = _extract_with_chatgpt(text)
     events: List[Dict[str, Any]] = []
 
-    # reset diagnostics
-    global _LAST_AI_DIAG
-    _LAST_AI_DIAG = {"attempts": 0, "used": 0, "failures": 0}
+    for item in raw_items:
+        title = str(item.get("title", "")).strip() or "Due"
+        due_date = str(item.get("due_date", "")).strip()
+        description = str(item.get("description", title)).strip()
 
-    for idx, line in enumerate(lines):
-        if not line:
-            continue
-
-        matches = list(_find_date_matches(line))
-        if not matches:
-            continue
-
-        context = line
-        # If the current line is short, append the following line for more detail,
-        # but avoid pulling in citation/metadata-looking lines.
-        if len(context) < 25 and idx + 1 < len(lines):
-            nxt = lines[idx + 1]
-            if nxt and not _has_negative_citation_cues(nxt):
-                # Avoid merging if the next line itself contains a date token (likely a separate event)
-                has_date_in_next = any(True for _ in _find_date_matches(nxt))
-                if not has_date_in_next:
-                    context = f"{context} {nxt}".strip()
-        
-        for token in matches:
-            parsed = _parse_date_token(token, today, base_year)
-            if not parsed:
-                continue
-
-            # 1) reject obviously historical dates
-            if _looks_like_historical_year(parsed):
-                continue
-
-            # If we have a custom semester window that wraps (e.g., Aug–Jan) and
-            # the token had no explicit year, shift months before start into base_year+1
-            if semester_window:
-                m1, m2, _y = semester_window
-                if m2 < m1 and not _token_has_year(token):
-                    parsed = parsed.replace(year=(base_year if parsed.month >= m1 else base_year + 1))
-
-            has_positive = _has_positive_deadline_cues(context)
-
-            # Strictly enforce selected semester season if provided
-            if semester_choice and year_choice and not in_semester_window(parsed, semester_choice, year_choice):
-                continue
-
-            # If a custom month window is provided (advanced), enforce it strictly
-            if semester_window and not in_semester_window_window(parsed, semester_window):
-                continue
-
-            # 2) if date is outside the term window (base_year ± 1) and no positive cue, skip
-            if not _in_plausible_academic_window(parsed, base_year) and not has_positive:
-                continue
-
-            # 3) if the line looks like a citation or has a URL and no positive cue, skip
-            if (_has_negative_citation_cues(context) or _has_url(context)) and not has_positive:
-                continue
-
-            if not _looks_like_deadline(context, use_ai=use_ai, ai_diag=_LAST_AI_DIAG):
-                continue
-
-            cleaned_description = _strip_token_from_context(token, context)
-            # Very short/empty descriptions without any deadline cues are likely not real
-            if len(cleaned_description.split()) <= 2 and not _has_positive_deadline_cues(context):
-                continue
-
-            events.append({"date": parsed, "description": cleaned_description})
-
-
-    # Deduplicate by date and description pair while preserving order
-    seen = set()
-    unique_events = []
-    for event in sorted(events, key=lambda e: e["date"]):
-        signature = (event["date"].date().isoformat(), event["description"].lower())
-        if signature in seen:
-            continue
-        seen.add(signature)
-        unique_events.append(event)
-
-    return unique_events
-
-
-_MONTHS_PATTERN = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-_DATE_PATTERNS = (
-    rf"\b{_MONTHS_PATTERN}\s+\d{{1,2}}(?:,\s*\d{{4}})?\b",
-    r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b",
-    r"\b\d{4}-\d{1,2}-\d{1,2}\b",
-)
-_DATE_REGEXES = [re.compile(pattern, re.IGNORECASE) for pattern in _DATE_PATTERNS]
-
-
-def semester_window_from_choice(semester: str | None, year: int | None):
-    if not semester or not year:
-        return None
-    s = semester.lower()
-    if s == "fall":
-        return (8, 12, year)
-    if s == "spring":
-        return (1, 5, year)
-    if s == "summer":
-        return (6, 7, year)  # Summer per spec
-    return None
-
-
-def in_semester_window_window(dt: datetime, window) -> bool:
-    if not window:
-        return True
-    m1, m2, y = window
-    if m1 <= m2:
-        return (dt.year == y) and (m1 <= dt.month <= m2)
-    # Wrapping window (e.g., Aug–Jan): accept months >= m1 in year y, and months <= m2 in year y+1
-    return (dt.year == y and dt.month >= m1) or (dt.year == y + 1 and dt.month <= m2)
-
-
-def in_semester_window(date_obj: datetime, semester: str | None, year: int | None) -> bool:
-    """Return True if date_obj is within the seasonal semester window for the given year.
-
-    Fall:   months 8–12
-    Spring: months 1–5
-    Summer: months 6–7
-    If semester or year is not provided/unrecognized, allow (return True).
-    """
-    if not semester or not year:
-        return True
-    s = semester.lower()
-    if s == "fall":
-        m1, m2 = 8, 12
-    elif s == "spring":
-        m1, m2 = 1, 5
-    elif s == "summer":
-        m1, m2 = 6, 7
-    else:
-        return True
-    return (date_obj.year == year) and (m1 <= date_obj.month <= m2)
-
-
-def _find_date_matches(line: str) -> Iterable[str]:
-    for regex in _DATE_REGEXES:
-        for match in regex.findall(line):
-            if isinstance(match, tuple):
-                yield match[0]
-            else:
-                yield match
-
-
-def _parse_date_token(token: str, today: date, base_year: int) -> datetime | None:
-    cleaned = token.strip()
-    cleaned = re.sub(r"(\d)(st|nd|rd|th)", r"\1", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned)
-
-    has_alpha = any(ch.isalpha() for ch in cleaned)
-    if has_alpha:
-        cleaned = cleaned.lower().title()
-
-    date_formats = (
-        "%B %d, %Y",
-        "%b %d, %Y",
-        "%B %d %Y",
-        "%b %d %Y",
-        "%B %d",
-        "%b %d",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%m/%d",
-        "%m-%d-%Y",
-        "%m-%d-%y",
-        "%m-%d",
-        "%Y-%m-%d",
-    )
-
-    for fmt in date_formats:
+        dt = None
         try:
-            parsed = datetime.strptime(cleaned, fmt)
-            if "%Y" not in fmt:
-                # No year present in the token; use the inferred syllabus year.
-                parsed = parsed.replace(year=base_year)
-            elif parsed.year < 100:
-                parsed = parsed.replace(year=2000 + parsed.year)
-            return parsed
-        except ValueError:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date):
+                dt = datetime.strptime(due_date, "%Y-%m-%d")
+            else:
+                # Accept natural formats and then normalize
+                dt_tmp = dparser.parse(due_date, fuzzy=True, dayfirst=False)
+                year = dt_tmp.year if dt_tmp.year and dt_tmp.year > 1900 else datetime.now().year
+                dt = datetime(year, dt_tmp.month, dt_tmp.day)
+        except Exception:
             continue
 
-    return None
+        events.append({"date": dt, "description": f"{title}: {description}"})
+
+    # Deduplicate and sort
+    seen = set()
+    unique = []
+    for e in sorted(events, key=lambda e: e["date"]):
+        sig = (e["date"].date().isoformat(), e["description"].lower())
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(e)
+
+    print("Events kept:", len(unique))
+    return unique
 
 
-def _strip_token_from_context(token: str, context: str) -> str:
-    pattern = re.compile(re.escape(token), re.IGNORECASE)
-    cleaned = pattern.sub("", context).strip(" -:\u2013\u2014")
-    if not cleaned:
-        cleaned = "Due"
-    return cleaned
 
 
-def _token_has_year(token: str) -> bool:
-    """Best-effort check whether the date token explicitly contains a year."""
-    if re.search(r"\b\d{4}\b", token):
-        return True
-    # numeric with year: 1/2/23 or 01-02-2024
-    if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", token):
-        return True
-    # Month Day, Year
-    if re.search(rf"{_MONTHS_PATTERN}\s+\d{{1,2}},\s*\d{{4}}\b", token, flags=re.IGNORECASE):
-        return True
-    return False
+
+
+
+
+# (legacy date token finder removed)
+
+
+# (legacy date token parser removed)
+
+
+# (legacy token stripping removed)
+
+
+# (legacy helper removed)
 
 
 # ----- Heuristic and optional-AI classification to filter out non-deadlines -----
@@ -438,185 +273,7 @@ _NEGATIVE_KEYWORDS = [
     "wall street journal",
 ]
 
-_TIME_HINTS = [
-    r"\b11:?59\b",
-    r"\b(1[0-2]|0?[1-9]):[0-5][0-9]\s*(am|pm)\b",
-    r"\bmidnight\b",
-    r"\bnoon\b",
-]
-_BY_TIME_RE = re.compile(
-    r"\bby\s+(?:11:?59|midnight|noon|(?:1[0-2]|0?[1-9]):[0-5][0-9]\s*(?:am|pm))\b", 
-    re.I
-)
-
-_BY_DATE_RE = re.compile(
-    rf"\bby\s+(?:{_MONTHS_PATTERN}\s+\d{{1,2}}(?:,\s*\d{{4}})?|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\b", 
-    re.I
-)
-
-_DUE_BY_RE = re.compile(r"\bdue\s+by\b", re.I)
-
-
-_MEETING_ONLY_HINTS = [
-    "lecture",
-    "class",
-    "topic",
-    "week ",
-    "session",
-]
-
-
-def _has_positive_deadline_cues(text: str) -> bool:
-    t = text.lower()
-    if any(k in t for k in _POSITIVE_KEYWORDS):
-        return True
-    # “due by …” or “by <time/date>”
-    if _DUE_BY_RE.search(t) or _BY_TIME_RE.search(t) or _BY_DATE_RE.search(t):
-        return True
-    # explicit time hints also count
-    for pat in _TIME_HINTS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            return True
-    return False
-
-
-def _has_negative_citation_cues(text: str) -> bool:
-    t = text.lower()
-    if any(k in t for k in _NEGATIVE_KEYWORDS):
-        return True
-    # Common citation patterns: "Lastname (2015)", "(2015)" near author-like tokens
-    if re.search(r"\b[A-Z][A-Za-z\-]+\s*\(\d{4}\)", text):
-        return True
-    if re.search(r"\(\d{4}\)\s*[.;]?$", text):
-        return True
-    # Year alongside journal-like markers
-    if re.search(r"\b\d{4}\b.*\b(pp\.|doi|vol\.|no\.)", t):
-        return True
-    return False
-
-
-def _meeting_only_context(text: str) -> bool:
-    t = text.lower()
-    return any(h in t for h in _MEETING_ONLY_HINTS) and not _has_positive_deadline_cues(t)
-
-
-def _looks_like_deadline(context: str, use_ai: bool | None = None, ai_diag: Dict[str, int] | None = None) -> bool:
-    """Decide if a line/context with a date likely represents a deadline.
-
-    Strategy:
-    - If strong negative citation cues and no positive cues -> reject.
-    - If meeting-only phrasing without positive cues -> reject.
-    - Otherwise require some positive cues OR sufficiently descriptive text.
-    """
-    # Optional AI hook: enable via use_ai flag (preferred) or env var USE_AI_CLASSIFIER
-    if use_ai is None:
-        use_ai = bool(os.environ.get("USE_AI_CLASSIFIER"))
-    if use_ai:
-        try:
-            if ai_diag is not None:
-                ai_diag["attempts"] = ai_diag.get("attempts", 0) + 1
-            ans = _ai_says_deadline(context)
-            if isinstance(ans, bool):
-                if ai_diag is not None:
-                    ai_diag["used"] = ai_diag.get("used", 0) + 1
-                if ans is False:
-                    return False
-            # If ans is None, fall back to heuristics
-        except Exception:
-            if ai_diag is not None:
-                ai_diag["failures"] = ai_diag.get("failures", 0) + 1
-            # Fall back to heuristics if AI is unavailable/fails
-            pass
-
-    if _has_negative_citation_cues(context) and not _has_positive_deadline_cues(context):
-        return False
-    if _meeting_only_context(context):
-        return False
-    # Reject citation-tail dates like ", Month Day, Year" when there are no positive cues
-    if re.search(rf",\s*{_MONTHS_PATTERN}\s+\d{{1,2}},\s*\d{{4}}\b", context, flags=re.IGNORECASE) \
-            and not _has_positive_deadline_cues(context):
-        return False
-
-    # Prefer lines that explicitly look like deliverables/exams or have time hints
-    if _has_positive_deadline_cues(context):
-        return True
-
-    # Otherwise, be conservative to avoid false positives from citations.
-    # Keep only if the non-date text is reasonably descriptive (>= 4 words)
-    words = [w for w in re.split(r"\s+", context.strip()) if w]
-    return len(words) >= 4
-
-
-def _ai_says_deadline(context: str) -> bool | None:
-    """Optional AI classifier. Returns True/False, or None on failure.
-
-    Requires: pip install openai, OPENAI_API_KEY, and USE_AI_CLASSIFIER=1.
-    """
-    try:
-        import openai  # type: ignore
-    except Exception:
-        return None
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
-
-    openai.api_key = "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"
-    try:
-        prompt = (
-            "You classify a syllabus line as deadline or not. "
-            "Return only 'yes' or 'no'.\n\n"
-            f"Line: {context!r}\n"
-        )
-        # Minimal tokens; compatible with legacy clients. Adjust as needed.
-        resp = openai.Completion.create(
-            model=os.environ.get("OPENAI_DEADLINE_MODEL", "gpt-3.5-turbo-instruct"),
-            prompt=prompt,
-            max_tokens=1,
-            temperature=0,
-        )
-        text = resp.choices[0].text.strip().lower()
-        if text.startswith("y"):
-            return True
-        if text.startswith("n"):
-            return False
-    except Exception:
-        return None
-    return None
-
-
-def _infer_year(text: str, default_year: int) -> int:
-    """Infer the intended syllabus year from the document text.
-
-    Strategy:
-    - Look for explicit 4-digit years (2000–2100) and pick the most frequent.
-    - On ties or no matches, fall back to the provided default_year.
-    """
-    # Prefer years found on non-citation lines to avoid bias from references
-    lines = text.splitlines()
-    candidate_years: list[int] = []
-    for ln in lines:
-        if _has_negative_citation_cues(ln):
-            continue
-        candidate_years.extend(int(y) for y in re.findall(r"\b(20\d{2}|19\d{2})\b", ln))
-
-    years = candidate_years or [int(y) for y in re.findall(r"\b(20\d{2}|19\d{2})\b", text)]
-    if not years:
-        return default_year
-
-    counts: dict[int, int] = {}
-    for y in years:
-        if 2000 <= y <= 2100:
-            counts[y] = counts.get(y, 0) + 1
-
-    if not counts:
-        return default_year
-
-    # Pick the most common; on tie choose closest to default_year, then smallest.
-    max_count = max(counts.values())
-    candidates = [y for y, c in counts.items() if c == max_count]
-    candidates.sort(key=lambda y: (abs(y - default_year), y))
-    return candidates[0]
+_POSITIVE_KEYWORDS = []  # legacy stub to avoid straggler references
 
 
 def add_calendar_links(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -676,3 +333,75 @@ def _escape_ics_text(value: str) -> str:
 
 if __name__ == "__main__":
     pass
+
+
+def _extract_with_chatgpt(text: str) -> List[Dict[str, Any]]:
+    """Call the ChatGPT API to extract JSON events from the syllabus text."""
+    try:
+        # New SDK style
+        from openai import OpenAI  # type: ignore
+    except Exception:
+        print("openai SDK not installed")
+        return []
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("No OPENAI_API_KEY in env")
+        return []
+
+    client = OpenAI(api_key=api_key)
+    model = os.environ.get("OPENAI_DEADLINE_MODEL", "gpt-4o-mini")
+
+    # Bound token usage
+    max_chars = int(os.environ.get("SYLLABUS_MAX_CHARS", "24000"))
+    snippet = text if len(text) <= max_chars else text[:max_chars]
+
+    system = "You extract syllabus deadlines and due dates. Output ONLY valid JSON (no prose)."
+    user = (
+        "Extract all concrete graded deadlines (quizzes, exams, outlines, term papers, projects, reflections) "
+        "from this syllabus. Normalize dates to YYYY-MM-DD. Fields per item:\n"
+        '{ "title": "<short name>", "due_date": "YYYY-MM-DD", "description": "<details if available>" }\n\n'
+        f"Syllabus text:\n```\n{snippet}\n```"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        print("RAW MODEL LEN:", len(content))
+    except Exception as e:
+        print("OpenAI call failed:", repr(e))
+        return []
+
+    # Strip code fences if present
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?", "", content).strip()
+        if content.endswith("```"):
+            content = content[:-3].strip()
+
+    # Parse JSON; if it fails, try to salvage the first JSON array
+    try:
+        data = json.loads(content)
+    except Exception:
+        m = re.search(r"\[.*\]", content, flags=re.S)
+        if not m:
+            print("No JSON array found in model output.")
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except Exception as e:
+            print("JSON parse error:", repr(e))
+            return []
+
+    if not isinstance(data, list):
+        print("Model output not a list.")
+        return []
+
+    return [d for d in data if isinstance(d, dict)]
+
