@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entry • MySyllabus</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>{{ label or 'Saved Entry' }}</h1>
+      <p>Saved at {{ created_at }}</p>
+      <p><a href="{{ url_for('history') }}">← Back to History</a></p>
+    </header>
+
+    {% if grouped_events %}
+      <section class="calendar">
+        {% for month, events in grouped_events.items() %}
+          <article class="month-block">
+            <h2>{{ month }}</h2>
+            <ul>
+              {% for event in events %}
+                <li>
+                  <div class="date">{{ event.date.strftime('%b %d, %Y') }}</div>
+                  <div class="details">
+                    <p>{{ event.description }}</p>
+                    <a href="{{ event.google_link }}" target="_blank" rel="noopener">Add to Google Calendar</a>
+                  </div>
+                </li>
+              {% endfor %}
+            </ul>
+          </article>
+        {% endfor %}
+      </section>
+    {% else %}
+      <p>No dated events.</p>
+    {% endif %}
+
+    {% if recurring_items %}
+      <section class="month-block" style="margin-top:1.5rem;">
+        <h2>Recurring Items</h2>
+        <ul>
+          {% for item in recurring_items %}
+            <li><div class="details"><p>{{ item.description if item.description else item }}</p></li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>
+

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dateutil import parser as dparser
 import re
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any
 import json
 import os
+import sqlite3
+import uuid
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,6 +33,46 @@ except ModuleNotFoundError:  # pragma: no cover - handled at runtime
 
 app = Flask(__name__)
 app.secret_key = "replace-me"  # simple default; override in production
+
+# --- Persistence (SQLite) ---
+DB_PATH = os.path.join(os.path.dirname(__file__), "syllabus.db")
+
+def _db_conn():
+    return sqlite3.connect(DB_PATH)
+
+def _init_db():
+    with _db_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_entry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                visitor_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                term_year INTEGER NULL,
+                start_month INTEGER NULL,
+                end_month INTEGER NULL,
+                events_json TEXT NOT NULL,
+                recurring_json TEXT NOT NULL,
+                label TEXT NULL
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_entry_visitor_created ON saved_entry(visitor_id, created_at DESC);")
+
+_init_db()
+
+
+def _get_or_create_visitor_id() -> str:
+    vid = request.cookies.get("visitor_id")
+    if vid and isinstance(vid, str) and len(vid) <= 64:
+        return vid
+    return uuid.uuid4().hex
+
+@app.after_request
+def _ensure_visitor_cookie(resp):
+    if not request.cookies.get("visitor_id"):
+        resp.set_cookie("visitor_id", _get_or_create_visitor_id(), httponly=True, samesite="Lax", max_age=60*60*24*365*2)
+    return resp
 
 # Using ChatGPT for extraction; no heuristic diagnostics needed
 
@@ -63,6 +104,10 @@ def index():
                 print("PDF preview:", text[:300].replace("\n"," "))
                 due_dates = extract_due_dates(text, year)
                 session["ai_status"] = "active"
+                # Remember user parameters for Save Entry
+                session["term_year"] = year
+                session["start_month"] = start_month
+                session["end_month"] = end_month
                 # Split dated and recurring items
                 dated_events, recurring_items = split_events(due_dates)
                 # Store only dated events for ICS usage
@@ -100,6 +145,134 @@ def index():
         use_ai=session.get("use_ai", False),
         ai_status=session.get("ai_status", "off"),
     )
+
+
+@app.route("/save-entry", methods=["POST"])
+def save_entry():
+    stored = session.get("events")
+    recurring = session.get("recurring")
+    if not stored and not recurring:
+        flash("Nothing to save yet. Upload and extract first.", "warning")
+        return redirect(url_for("index"))
+
+    visitor_id = _get_or_create_visitor_id()
+    label = (request.form.get("label") or "").strip() or None
+    term_year = session.get("term_year")
+    start_month = session.get("start_month")
+    end_month = session.get("end_month")
+
+    events_json = json.dumps(stored or [])
+    recurring_json = json.dumps(recurring or [])
+
+    with _db_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO saved_entry (visitor_id, created_at, term_year, start_month, end_month, events_json, recurring_json, label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                visitor_id,
+                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                term_year,
+                start_month,
+                end_month,
+                events_json,
+                recurring_json,
+                label,
+            ),
+        )
+        entry_id = cur.lastrowid
+
+    flash("Entry saved.", "info")
+    resp = redirect(url_for("history"))
+    # Ensure cookie is set on redirect
+    if not request.cookies.get("visitor_id"):
+        resp.set_cookie("visitor_id", visitor_id, httponly=True, samesite="Lax", max_age=60*60*24*365*2)
+    return resp
+
+
+@app.route("/history")
+def history():
+    visitor_id = _get_or_create_visitor_id()
+    with _db_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, term_year, start_month, end_month, events_json, label FROM saved_entry WHERE visitor_id=? ORDER BY created_at DESC",
+            (visitor_id,),
+        ).fetchall()
+
+    entries = []
+    for (eid, created_at, term_year, sm, em, events_json, label) in rows:
+        try:
+            count = len(json.loads(events_json or "[]"))
+        except Exception:
+            count = 0
+        entries.append({
+            "id": eid,
+            "created_at": created_at,
+            "term_year": term_year,
+            "start_month": sm,
+            "end_month": em,
+            "label": label or "",
+            "count": count,
+        })
+
+    return render_template("history.html", entries=entries)
+
+
+@app.route("/history/<int:entry_id>")
+def history_detail(entry_id: int):
+    visitor_id = _get_or_create_visitor_id()
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT id, visitor_id, created_at, term_year, start_month, end_month, events_json, recurring_json, label FROM saved_entry WHERE id=?",
+            (entry_id,),
+        ).fetchone()
+    if not row or row[1] != visitor_id:
+        flash("Entry not found.", "error")
+        return redirect(url_for("history"))
+
+    _, _, created_at, term_year, sm, em, events_json, recurring_json, label = row
+    try:
+        raw_events = json.loads(events_json or "[]")
+    except Exception:
+        raw_events = []
+    try:
+        recurring_items = json.loads(recurring_json or "[]")
+    except Exception:
+        recurring_items = []
+
+    # Rehydrate dated events to datetime and add calendar links
+    dated_events = []
+    for item in raw_events:
+        try:
+            dt = datetime.fromisoformat(item["date"]).replace(tzinfo=None)
+            dated_events.append({"date": dt, "description": item["description"]})
+        except Exception:
+            continue
+
+    events_with_links = add_calendar_links(dated_events)
+    grouped = group_events_by_month(events_with_links)
+
+    return render_template(
+        "history_detail.html",
+        label=label or "",
+        created_at=created_at,
+        grouped_events=grouped,
+        recurring_items=recurring_items,
+    )
+
+
+@app.route("/delete-entry/<int:entry_id>", methods=["POST"])
+def delete_entry(entry_id: int):
+    visitor_id = _get_or_create_visitor_id()
+    with _db_conn() as conn:
+        row = conn.execute("SELECT visitor_id FROM saved_entry WHERE id=?", (entry_id,)).fetchone()
+        if not row or row[0] != visitor_id:
+            flash("Entry not found.", "error")
+            return redirect(url_for("history"))
+        conn.execute("DELETE FROM saved_entry WHERE id=?", (entry_id,))
+    flash("Entry deleted.", "info")
+    return redirect(url_for("history"))
 
 
 @app.route("/download-ics", methods=["POST"])

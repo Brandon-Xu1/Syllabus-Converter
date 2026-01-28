@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>History • MySyllabus</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    .history-actions { display:flex; gap:.5rem; justify-content:flex-end }
+    .table { width:100%; border-collapse: collapse; }
+    .table th, .table td { text-align:left; padding:.6rem .5rem; border-bottom:1px solid var(--border); }
+    .table th { font-weight:700; color: var(--muted); font-size:.9rem }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Saved History</h1>
+      <p>Your saved entries for this browser.</p>
+      <p><a href="{{ url_for('index') }}">← Back to Upload</a></p>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {% if entries %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Created</th>
+            <th>Label</th>
+            <th>Year</th>
+            <th>Events</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for e in entries %}
+            <tr>
+              <td>{{ e.created_at }}</td>
+              <td>{{ e.label }}</td>
+              <td>{{ e.term_year or '' }}</td>
+              <td>{{ e.count }}</td>
+              <td class="history-actions">
+                <a href="{{ url_for('history_detail', entry_id=e.id) }}">View</a>
+                <form method="post" action="{{ url_for('delete_entry', entry_id=e.id) }}" onsubmit="return confirm('Delete this entry?');">
+                  <button type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No saved entries yet.</p>
+    {% endif %}
+  </main>
+</body>
+</html>
+
