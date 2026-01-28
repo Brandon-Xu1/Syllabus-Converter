@@ -11,7 +11,7 @@
     <header>
       <h1>{{ label or 'Saved Entry' }}</h1>
       <p>Saved at {{ created_at }}</p>
-      <p><a href="{{ url_for('history') }}">← Back to History</a></p>
+      <p><a class="btn" href="{{ url_for('history') }}">← Back to History</a></p>
     </header>
 
     {% if grouped_events %}
@@ -50,4 +50,3 @@
   </main>
 </body>
 </html>
-

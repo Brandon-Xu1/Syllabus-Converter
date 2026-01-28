@@ -11,7 +11,7 @@
         <header>
             <h1>MySyllabus</h1>
             <p>Upload a PDF or text file and we will pull out the due dates for you.</p>
-            <p><a href="{{ url_for('history') }}">View History</a></p>
+            <p><a class="btn" href="{{ url_for('history') }}">View History</a></p>
         </header>
         {% if error %}
             <div class="alert alert-error">{{ error }}</div>
@@ -83,11 +83,11 @@
         {% if grouped_events %}
             <section class="actions">
                 <form action="{{ url_for('download_ics') }}" method="post">
-                    <button type="submit">Download ICS</button>
+                    <button type="submit" class="btn">Download ICS</button>
                 </form>
-                <form action="{{ url_for('save_entry') }}" method="post">
-                    <input type="text" name="label" placeholder="Optional label" style="margin-right:.5rem" />
-                    <button type="submit">Save Entry</button>
+                <form action="{{ url_for('save_entry') }}" method="post" class="save-form-inline">
+                    <input type="text" name="label" placeholder="Optional label" class="input-text label-input" />
+                    <button type="submit" class="btn">Save Entry</button>
                 </form>
             </section>
             <section class="calendar">

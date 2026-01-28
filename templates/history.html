@@ -17,7 +17,7 @@
     <header>
       <h1>Saved History</h1>
       <p>Your saved entries for this browser.</p>
-      <p><a href="{{ url_for('index') }}">← Back to Upload</a></p>
+      <p><a class="btn" href="{{ url_for('index') }}">← Back to Upload</a></p>
     </header>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -47,8 +47,8 @@
               <td>{{ e.term_year or '' }}</td>
               <td>{{ e.count }}</td>
               <td class="history-actions">
-                <a href="{{ url_for('history_detail', entry_id=e.id) }}">View</a>
-                <form method="post" action="{{ url_for('delete_entry', entry_id=e.id) }}" onsubmit="return confirm('Delete this entry?');">
+                <a class="btn" href="{{ url_for('history_detail', entry_id=e.id) }}">View</a>
+                <form method="post" action="{{ url_for('delete_entry', entry_id=e.id) }}" onsubmit="return confirm('Delete this entry?');"style="display:inline;">
                   <button type="submit">Delete</button>
                 </form>
               </td>
@@ -62,4 +62,3 @@
   </main>
 </body>
 </html>
-

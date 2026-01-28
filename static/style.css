@@ -196,6 +196,55 @@ button:hover {
     background: var(--accent-dark);
 }
 
+/* Link-styled buttons */
+
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  
+    background: var(--accent);
+    color: #fff;
+  
+    padding: 0.6rem 1.1rem;
+    border-radius: 999px;
+  
+    font-weight: 600;
+    font-size: 1rem;     /* ensures same size everywhere */
+    line-height: 1;
+  
+    text-decoration: none;
+    border: 0;           /* important for <button> */
+    cursor: pointer;     /* important for <button> */
+  
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+.btn:hover { background: var(--accent-dark); color: #fff; }
+.btn.btn-secondary { background: #566cd6; }
+.btn.btn-secondary:hover { background: #3f53c7; }
+
+/* Inline save form input */
+.save-form-inline {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+}
+.input-text.label-input {
+    font: inherit;
+    background-color: #f9fafb;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.6rem 0.9rem;
+    min-width: 220px;
+}
+.input-text.label-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(76, 110, 245, 0.2);
+    background-color: #fff;
+}
+
 .actions {
     display: flex;
     justify-content: flex-end;
