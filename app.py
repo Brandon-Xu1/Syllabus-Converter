@@ -6,6 +6,8 @@ from typing import List, Dict, Any
 import json
 import os
 import sqlite3
+import hashlib
+from typing import Tuple
 import uuid
 from dotenv import load_dotenv
 
@@ -58,6 +60,18 @@ def _init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_entry_visitor_created ON saved_entry(visitor_id, created_at DESC);")
+        # Cache table for extraction results
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS extraction_cache (
+                cache_key TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                text_len INTEGER NOT NULL,
+                events_json TEXT NOT NULL
+            );
+            """
+        )
 
 _init_db()
 
@@ -102,7 +116,13 @@ def index():
                 text = extract_text(uploaded)
                 print("PDF text chars:", len(text))
                 print("PDF preview:", text[:300].replace("\n"," "))
-                due_dates = extract_due_dates(text, year)
+                due_dates = extract_due_dates(
+                    text,
+                    user_year=year,
+                    start_month=start_month,
+                    end_month=end_month,
+                    use_ai=session.get("use_ai", False),
+                )
                 session["ai_status"] = "active"
                 # Remember user parameters for Save Entry
                 session["term_year"] = year
@@ -329,7 +349,13 @@ def _looks_like_historical_year(d: datetime) -> bool:
 
 
 
-def extract_due_dates(text: str, user_year: int | None = None) -> List[Dict[str, Any]]:
+def extract_due_dates(
+    text: str,
+    user_year: int | None = None,
+    start_month: int | None = None,
+    end_month: int | None = None,
+    use_ai: bool = True,
+) -> List[Dict[str, Any]]:
     """Use ChatGPT to extract due dates and recurring items from the syllabus text.
 
     Returns a list of dicts with keys:
@@ -339,7 +365,21 @@ def extract_due_dates(text: str, user_year: int | None = None) -> List[Dict[str,
     # Debug: ensure PDF gave us real text
     print("PDF text chars:", len(text))
 
-    raw_items = _extract_with_chatgpt(text, user_year=user_year)
+    # Build a recall-first candidate text and use chunking + cache-aware extraction
+    candidate = build_candidate_text(text)
+    # If the candidate is too small, fallback to full text to avoid missing anything
+    snippet = text if len(candidate) < 1500 else candidate
+
+    raw_items = _extract_with_chatgpt(
+        snippet,
+        user_year=user_year,
+        cache_params={
+            "year": user_year,
+            "start_month": start_month,
+            "end_month": end_month,
+            "use_ai": bool(use_ai),
+        },
+    )
     events: List[Dict[str, Any]] = []
 
     for item in raw_items:
@@ -476,7 +516,6 @@ _NEGATIVE_KEYWORDS = [
     "wall street journal",
 ]
 
-_POSITIVE_KEYWORDS = []  # legacy stub to avoid straggler references
 
 
 def add_calendar_links(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -538,10 +577,73 @@ if __name__ == "__main__":
     pass
 
 
-def _extract_with_chatgpt(text: str, user_year: int | None = None) -> List[Dict[str, Any]]:
-    """Call the ChatGPT API to extract JSON events from the syllabus text."""
+DATE_WORDS = r"""
+    jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december|
+    mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|
+    \b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\b\d{4}-\d{2}-\d{2}|\b\d{1,2}:\d{2}\s?(?:am|pm)|\b\d{1,2}(?:am|pm)
+""".replace("\n"," ")
+
+KEYWORDS = [
+    "due", "deadline", "submit", "submission", "turn in", "upload",
+    "exam", "test", "quiz", "midterm", "final",
+    "assignment", "homework", "hw", "project", "paper", "essay", "lab", "report", "proposal", "draft",
+    "presentation", "checkpoint", "milestone", "gradescope", "canvas", "turnitin",
+]
+
+
+def build_candidate_text(full_text: str) -> str:
+    """Recall-first selector: choose lines with deadline cues or date-like tokens, with ±3 lines context.
+
+    Preserves order and deduplicates overlapping ranges. Falls back to full text if too small.
+    """
+    if not full_text:
+        return ""
+
+    lines = full_text.splitlines()
+    matches: List[Tuple[int, int]] = []
+    date_rx = re.compile(DATE_WORDS, re.I)
+    kw_rx = re.compile("|".join(re.escape(k) for k in KEYWORDS), re.I)
+
+    for i, line in enumerate(lines):
+        text = line.strip()
+        if not text:
+            continue
+        if kw_rx.search(text) or date_rx.search(text):
+            start = max(0, i - 3)
+            end = min(len(lines), i + 4)  # exclusive
+            matches.append((start, end))
+
+    if not matches:
+        return full_text
+
+    # Merge overlapping ranges
+    matches.sort()
+    merged: List[Tuple[int, int]] = []
+    cur_s, cur_e = matches[0]
+    for s, e in matches[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+
+    parts = []
+    for s, e in merged:
+        parts.extend(lines[s:e])
+        parts.append("")  # spacer to avoid run-on
+    candidate = "\n".join(parts).strip()
+
+    # If very small, better to send the full text to avoid misses
+    return candidate if len(candidate) >= 1500 else full_text
+
+
+def _extract_with_chatgpt(
+    text: str,
+    user_year: int | None = None,
+    cache_params: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     try:
-        # New SDK style
         from openai import OpenAI  # type: ignore
     except Exception:
         print("openai SDK not installed")
@@ -555,73 +657,103 @@ def _extract_with_chatgpt(text: str, user_year: int | None = None) -> List[Dict[
     client = OpenAI(api_key=api_key)
     model = os.environ.get("OPENAI_DEADLINE_MODEL", "gpt-4o-mini")
 
-    # Bound token usage
+    params = cache_params or {}
+    key_basis = json.dumps({"text": text, "params": params, "year": user_year}, ensure_ascii=False, sort_keys=True)
+    cache_key = hashlib.sha256(key_basis.encode("utf-8")).hexdigest()
+
+    with _db_conn() as conn:
+        row = conn.execute("SELECT events_json FROM extraction_cache WHERE cache_key=?", (cache_key,)).fetchone()
+    if row:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            pass
+
     max_chars = int(os.environ.get("SYLLABUS_MAX_CHARS", "24000"))
-    snippet = text if len(text) <= max_chars else text[:max_chars]
+    chunks = [text] if len(text) <= max_chars else [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+
+    target_year = str(user_year) if user_year is not None else "UNKNOWN"
 
     system = (
         "You extract graded deadlines and due dates. Output ONLY valid JSON (no prose). "
-        "The user-provided academic year is authoritative and must override the syllabus text. "
         "Never infer or guess calendar dates from month headers, semester ranges, or context. "
-        "Only include a due_date if there is an explicit date string present in the text."
-    )
-    target_year = str(user_year) if user_year is not None else "<MUST_FILL_YEAR>"
-    user = (
-        "You are extracting graded deadlines from a syllabus.\n\n"
-        f"The user has specified the academic year as {target_year}. This year is authoritative and MUST override the syllabus text.\n\n"
-        "Rules:\n"
-        f"- Output ONLY valid JSON (no prose).\n"
-        f"- Normalize all dates to the user-specified year {target_year}, even if the syllabus explicitly lists a different year.\n"
-        f"- If a date’s month/day appears but the year in the syllabus conflicts, replace the year with {target_year}.\n"
-        f"- Never output dates outside {target_year}.\n"
-        "- Never infer or guess missing month/day values.\n"
-        "- If an item is recurring (e.g., 'every Wednesday') and no explicit calendar date is given, set due_date to null and include the recurrence text.\n\n"
-        "Only include graded items (assignments, exams, quizzes, projects, papers).\n\n"
-        "Schema per item:\n"
-        '{ "title": string, "due_date": "YYYY-MM-DD" | null, "recurrence": string | null, "description": string }\n\n'
-        f"Syllabus text:\n```\n{snippet}\n```"
+        "Only include a due_date if there is an explicit date string present in the text. "
+        "If an item is recurring and no explicit calendar date is given, set due_date to null and include recurrence."
     )
 
-    try:
+    merged: List[Dict[str, Any]] = []
+
+    for chunk in chunks:
+        snippet = chunk  # NOW snippet exists
+
+        user = (
+            "Extract graded deadlines from this syllabus.\n\n"
+            f"User-selected academic year: {target_year} (authoritative; override conflicting years in text).\n\n"
+            "Rules:\n"
+            "- Output ONLY valid JSON.\n"
+            f"- If user-selected year is {target_year}, normalize dates to that year when month/day are explicit.\n"
+            "- Never invent missing month/day.\n"
+            "- Recurring without explicit date => due_date=null and recurrence filled.\n\n"
+            "Schema per item:\n"
+            '{ "title": string, "due_date": "YYYY-MM-DD" | null, "recurrence": string | null, "description": string }\n\n'
+            f"Syllabus text:\n```\n{snippet}\n```"
+        )
+
         resp = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0,
         )
+
         content = (resp.choices[0].message.content or "").strip()
-        print("RAW MODEL LEN:", len(content))
-    except Exception as e:
-        print("OpenAI call failed:", repr(e))
-        return []
 
-    # Strip code fences if present
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?", "", content).strip()
-        if content.endswith("```"):
-            content = content[:-3].strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?", "", content).strip()
+            if content.endswith("```"):
+                content = content[:-3].strip()
 
-    # Parse JSON; if it fails, try to salvage the first JSON array
-    try:
-        data = json.loads(content)
-    except Exception:
-        m = re.search(r"\[.*\]", content, flags=re.S)
-        if not m:
-            print("No JSON array found in model output.")
-            return []
         try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"\[.*\]", content, flags=re.S)
+            if not m:
+                continue
             data = json.loads(m.group(0))
-        except Exception as e:
-            print("JSON parse error:", repr(e))
-            return []
 
-    if not isinstance(data, list):
-        print("Model output not a list.")
-        return []
+        if isinstance(data, list):
+            merged.extend([d for d in data if isinstance(d, dict)])
 
-    return [d for d in data if isinstance(d, dict)]
+    # dedupe
+    seen = set()
+    deduped = []
+    for d in merged:
+        key = (
+            d.get("due_date") or None,
+            (d.get("recurrence") or "").strip().lower(),
+            (d.get("title") or "").strip().lower(),
+            (d.get("description") or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(d)
+
+    result = deduped
+
+    with _db_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO extraction_cache (cache_key, created_at, params_json, text_len, events_json) VALUES (?, ?, ?, ?, ?)",
+            (
+                cache_key,
+                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                json.dumps(params, sort_keys=True),
+                len(text),
+                json.dumps(result),
+            ),
+        )
+
+    return result
+
 
 
 def split_events(events: List[Dict[str, Any]]):
