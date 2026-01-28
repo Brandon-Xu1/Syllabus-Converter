@@ -40,6 +40,7 @@ app.secret_key = "replace-me"  # simple default; override in production
 def index():
     error = None
     events: List[Dict[str, Any]] = []
+    recurring_items: List[Dict[str, Any]] = []
 
     if request.method == "POST":
         uploaded = request.files.get("syllabus")
@@ -60,13 +61,22 @@ def index():
                 text = extract_text(uploaded)
                 print("PDF text chars:", len(text))
                 print("PDF preview:", text[:300].replace("\n"," "))
-                due_dates = extract_due_dates(text)
+                due_dates = extract_due_dates(text, year)
                 session["ai_status"] = "active"
+                # Split dated and recurring items
+                dated_events, recurring_items = split_events(due_dates)
+                # Store only dated events for ICS usage
                 session["events"] = [
                     {"date": event["date"].isoformat(), "description": event["description"]}
-                    for event in due_dates
+                    for event in dated_events
                 ]
-                events = add_calendar_links(due_dates)
+                # Store recurring items separately for display-only
+                session["recurring"] = [
+                    {"date": None, "description": item["description"]}
+                    for item in recurring_items
+                ]
+                # Only build calendar links for dated events
+                events = add_calendar_links(dated_events)
                 if not events:
                     flash("No due dates were detected. Try cleaning up the PDF or uploading a text export.", "info")
             except RuntimeError as exc:
@@ -76,14 +86,16 @@ def index():
 
     else:
         # Reset UI to original state on refresh/open by clearing transient session state
-        for key in ("events", "use_ai", "ai_status"):
+        for key in ("events", "recurring", "use_ai", "ai_status"):
             session.pop(key, None)
 
+    # Only group dated events for monthly view
     grouped = group_events_by_month(events)
 
     return render_template(
         "index.html",
         grouped_events=grouped,
+        recurring_items=session.get("recurring", []),
         error=error,
         use_ai=session.get("use_ai", False),
         ai_status=session.get("ai_status", "off"),
@@ -144,41 +156,59 @@ def _looks_like_historical_year(d: datetime) -> bool:
 
 
 
-def extract_due_dates(text: str) -> List[Dict[str, Any]]:
-    """Use ChatGPT to extract due dates from the syllabus text.
+def extract_due_dates(text: str, user_year: int | None = None) -> List[Dict[str, Any]]:
+    """Use ChatGPT to extract due dates and recurring items from the syllabus text.
 
-    Returns a list of dicts: {"date": datetime, "description": str}
+    Returns a list of dicts with keys:
+      - "date": datetime | None
+      - "description": str
     """
     # Debug: ensure PDF gave us real text
     print("PDF text chars:", len(text))
 
-    raw_items = _extract_with_chatgpt(text)
+    raw_items = _extract_with_chatgpt(text, user_year=user_year)
     events: List[Dict[str, Any]] = []
 
     for item in raw_items:
         title = str(item.get("title", "")).strip() or "Due"
-        due_date = str(item.get("due_date", "")).strip()
+        # Allow due_date to be None
+        due_date_val = item.get("due_date")
+        recurrence_val = item.get("recurrence")
         description = str(item.get("description", title)).strip()
 
-        dt = None
-        try:
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date):
-                dt = datetime.strptime(due_date, "%Y-%m-%d")
-            else:
-                # Accept natural formats and then normalize
-                dt_tmp = dparser.parse(due_date, fuzzy=True, dayfirst=False)
-                year = dt_tmp.year if dt_tmp.year and dt_tmp.year > 1900 else datetime.now().year
-                dt = datetime(year, dt_tmp.month, dt_tmp.day)
-        except Exception:
-            continue
-
-        events.append({"date": dt, "description": f"{title}: {description}"})
+        # If explicit due_date provided, parse it into datetime
+        if isinstance(due_date_val, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date_val.strip()):
+            try:
+                dt = datetime.strptime(due_date_val.strip(), "%Y-%m-%d")
+                # Enforce authoritative user_year if provided
+                if user_year is not None:
+                    try:
+                        dt = dt.replace(year=user_year)
+                    except ValueError:
+                        # Invalid date in target year (e.g., Feb 29 on non-leap year)
+                        continue
+                events.append({"date": dt, "description": f"{title}: {description}"})
+            except Exception:
+                # Skip invalid date strings
+                continue
+        else:
+            # No explicit date. If recurrence exists, keep as undated recurring item.
+            rec_str = (str(recurrence_val).strip() if recurrence_val is not None else "")
+            if rec_str:
+                events.append({"date": None, "description": f"{title}: {rec_str}"})
+            # If neither due_date nor recurrence, ignore
 
     # Deduplicate and sort
     seen = set()
-    unique = []
-    for e in sorted(events, key=lambda e: e["date"]):
-        sig = (e["date"].date().isoformat(), e["description"].lower())
+    unique: List[Dict[str, Any]] = []
+    # Sort with None dates last, keep deterministic order
+    def _sort_key(e: Dict[str, Any]):
+        return (e["date"] is None, e["date"] or datetime.max)
+    for e in sorted(events, key=_sort_key):
+        if e["date"] is None:
+            sig = (None, e["description"].lower())
+        else:
+            sig = (e["date"].date().isoformat(), e["description"].lower())
         if sig in seen:
             continue
         seen.add(sig)
@@ -335,7 +365,7 @@ if __name__ == "__main__":
     pass
 
 
-def _extract_with_chatgpt(text: str) -> List[Dict[str, Any]]:
+def _extract_with_chatgpt(text: str, user_year: int | None = None) -> List[Dict[str, Any]]:
     """Call the ChatGPT API to extract JSON events from the syllabus text."""
     try:
         # New SDK style
@@ -356,11 +386,26 @@ def _extract_with_chatgpt(text: str) -> List[Dict[str, Any]]:
     max_chars = int(os.environ.get("SYLLABUS_MAX_CHARS", "24000"))
     snippet = text if len(text) <= max_chars else text[:max_chars]
 
-    system = "You extract syllabus deadlines and due dates. Output ONLY valid JSON (no prose)."
+    system = (
+        "You extract graded deadlines and due dates. Output ONLY valid JSON (no prose). "
+        "The user-provided academic year is authoritative and must override the syllabus text. "
+        "Never infer or guess calendar dates from month headers, semester ranges, or context. "
+        "Only include a due_date if there is an explicit date string present in the text."
+    )
+    target_year = str(user_year) if user_year is not None else "<MUST_FILL_YEAR>"
     user = (
-        "Extract all concrete graded deadlines (quizzes, exams, outlines, term papers, projects, reflections) "
-        "from this syllabus. Normalize dates to YYYY-MM-DD. Fields per item:\n"
-        '{ "title": "<short name>", "due_date": "YYYY-MM-DD", "description": "<details if available>" }\n\n'
+        "You are extracting graded deadlines from a syllabus.\n\n"
+        f"The user has specified the academic year as {target_year}. This year is authoritative and MUST override the syllabus text.\n\n"
+        "Rules:\n"
+        f"- Output ONLY valid JSON (no prose).\n"
+        f"- Normalize all dates to the user-specified year {target_year}, even if the syllabus explicitly lists a different year.\n"
+        f"- If a date’s month/day appears but the year in the syllabus conflicts, replace the year with {target_year}.\n"
+        f"- Never output dates outside {target_year}.\n"
+        "- Never infer or guess missing month/day values.\n"
+        "- If an item is recurring (e.g., 'every Wednesday') and no explicit calendar date is given, set due_date to null and include the recurrence text.\n\n"
+        "Only include graded items (assignments, exams, quizzes, projects, papers).\n\n"
+        "Schema per item:\n"
+        '{ "title": string, "due_date": "YYYY-MM-DD" | null, "recurrence": string | null, "description": string }\n\n'
         f"Syllabus text:\n```\n{snippet}\n```"
     )
 
@@ -405,3 +450,17 @@ def _extract_with_chatgpt(text: str) -> List[Dict[str, Any]]:
 
     return [d for d in data if isinstance(d, dict)]
 
+
+def split_events(events: List[Dict[str, Any]]):
+    """Split events into dated and recurring (undated) lists.
+
+    Returns (dated_events, recurring_items)
+    """
+    dated: List[Dict[str, Any]] = []
+    recurring: List[Dict[str, Any]] = []
+    for e in events:
+        if e.get("date") is None:
+            recurring.append(e)
+        else:
+            dated.append(e)
+    return dated, recurring

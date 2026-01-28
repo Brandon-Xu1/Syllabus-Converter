@@ -23,7 +23,7 @@
             {% endif %}
         {% endwith %}
         <section class="upload">
-            <form method="post" enctype="multipart/form-data">
+            <form id="syllabus-form" method="post" enctype="multipart/form-data">
                 <div class="file-control">
                     <label for="syllabus">Choose a file (PDF or TXT)</label>
                     <span id="syllabus-file-name" class="file-name" aria-live="polite">No file chosen</span>
@@ -31,17 +31,17 @@
                 </div>
                 <label>Term:</label>
                 <select name="semester" id="semester">
-                    <option value="" {% if not request.form.get('semester') %}selected{% endif %}>(auto)</option>
+                    <option value="" {% if not request.form.get('semester') %}selected{% endif %}>(Auto)</option>
                     <option value="fall"   {% if request.form.get('semester')=='fall' %}selected{% endif %}>Fall</option>
                     <option value="spring" {% if request.form.get('semester')=='spring' %}selected{% endif %}>Spring</option>
                     <option value="summer" {% if request.form.get('semester')=='summer' %}selected{% endif %}>Summer</option>
                 </select>
                 <label>Year:</label>
-                <input name="year" type="number" min="2000" max="2100" value="{{ request.form.get('year','') }}" placeholder="2025" />
+                <input name="year" type="number" min="2000" max="2100" value="{{ request.form.get('year','') }}" placeholder="2026" />
                 <div class="term-range-row" id="term-range-row" {% if not request.form.get('semester') %}style="display:none"{% endif %}>
                     <label for="start_month">Start month:</label>
                     <select name="start_month" id="start_month">
-                        <option value="" {% if not request.form.get('start_month') %}selected{% endif %}>(auto)</option>
+                        <option value="" {% if not request.form.get('start_month') %}selected{% endif %}>(Auto)</option>
                         <option value="1"  {% if request.form.get('start_month')=='1' %}selected{% endif %}>January</option>
                         <option value="2"  {% if request.form.get('start_month')=='2' %}selected{% endif %}>February</option>
                         <option value="3"  {% if request.form.get('start_month')=='3' %}selected{% endif %}>March</option>
@@ -57,7 +57,7 @@
                     </select>
                     <label for="end_month">End month:</label>
                     <select name="end_month" id="end_month">
-                        <option value="" {% if not request.form.get('end_month') %}selected{% endif %}>(auto)</option>
+                        <option value="" {% if not request.form.get('end_month') %}selected{% endif %}>(Auto)</option>
                         <option value="1"  {% if request.form.get('end_month')=='1' %}selected{% endif %}>January</option>
                         <option value="2"  {% if request.form.get('end_month')=='2' %}selected{% endif %}>February</option>
                         <option value="3"  {% if request.form.get('end_month')=='3' %}selected{% endif %}>March</option>
@@ -74,6 +74,10 @@
                 </div>
                 <button type="submit">Extract Deadlines</button>
             </form>
+            <!-- Loading overlay (hidden by default) -->
+            <div id="loading-overlay" class="loading-overlay" aria-hidden="true" hidden>
+                <div class="spinner" role="status" aria-label="Loading"></div>
+            </div>
         </section>
         {% if grouped_events %}
             <section class="actions">
@@ -123,6 +127,21 @@
                 };
                 semSelect.addEventListener('change', sync);
                 sync();
+            }
+            // Minimal loading overlay on form submit
+            const form = document.getElementById('syllabus-form');
+            const overlay = document.getElementById('loading-overlay');
+            if (form && overlay) {
+                const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
+                form.addEventListener('submit', function () {
+                    overlay.hidden = false;
+                    if (submitBtn) {
+                        submitBtn.disabled = true;
+                        const txt = (submitBtn.textContent || submitBtn.value || '').trim();
+                        if ('textContent' in submitBtn) submitBtn.textContent = txt ? 'Uploading…' : submitBtn.textContent;
+                        else submitBtn.value = 'Uploading…';
+                    }
+                });
             }
         });
     </script>
