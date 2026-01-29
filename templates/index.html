@@ -11,7 +11,6 @@
         <header>
             <h1>MySyllabus</h1>
             <p>Upload a PDF or text file and we will pull out the due dates for you.</p>
-            <p><a class="btn" href="{{ url_for('history') }}">View History</a></p>
         </header>
         {% if error %}
             <div class="alert alert-error">{{ error }}</div>
@@ -74,6 +73,9 @@
                     </select>
                 </div>
                 <button type="submit">Extract Deadlines</button>
+                <div class="subtle-action">
+                    <a class="link-action" href="{{ url_for('history') }}">View History</a>
+                </div>
             </form>
             <!-- Loading overlay (hidden by default) -->
             <div id="loading-overlay" class="loading-overlay" aria-hidden="true" hidden>

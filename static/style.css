@@ -196,6 +196,21 @@ button:hover {
     background: var(--accent-dark);
 }
 
+/* Subtle secondary action under primary button */
+.subtle-action {
+    text-align: center;
+    margin-top: .5rem;
+}
+.link-action {
+    color: var(--muted);
+    text-decoration: none;
+    font-weight: 600;
+}
+.link-action:hover { text-decoration: underline; color: var(--accent-dark); }
+
+/* Extra space below history table */
+.history-bottom-action { margin-top: 1rem; }
+
 /* Link-styled buttons */
 
 

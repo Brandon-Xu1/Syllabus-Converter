@@ -17,7 +17,6 @@
     <header>
       <h1>Saved History</h1>
       <p>Your saved entries for this browser.</p>
-      <p><a class="btn" href="{{ url_for('index') }}">← Back to Upload</a></p>
     </header>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -59,6 +58,7 @@
     {% else %}
       <p>No saved entries yet.</p>
     {% endif %}
+    <div class="subtle-action history-bottom-action"><a class="link-action" href="{{ url_for('index') }}">← Back to Upload</a></div>
   </main>
 </body>
 </html>
