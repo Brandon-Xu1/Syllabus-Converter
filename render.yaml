@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: syllabus-converter
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: TRUST_PROXY
+        value: "1"
