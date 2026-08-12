@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Brandon-Xu1/Syllabus-Converter/actions/workflows/ci.yml/badge.svg)](https://github.com/Brandon-Xu1/Syllabus-Converter/actions/workflows/ci.yml)
 
+**Live demo: [syllabus-converter.onrender.com](https://syllabus-converter.onrender.com/)** — hosted on a free tier, so if the first load takes a few seconds it's just waking up. Try it with [`samples/sample_syllabus.txt`](samples/sample_syllabus.txt).
+
 A Flask web app that turns a course syllabus (PDF, DOCX, or TXT) into calendar deadlines. Upload a syllabus, review the extracted due dates grouped by month, add individual events to Google Calendar, or download everything as an `.ics` file. Results can be saved to a per-browser history — no account required.
 
 ## How it works
