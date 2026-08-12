@@ -1,6 +1,7 @@
 # Ignore Python cache and bytecode
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Ignore virtual environments
 venv/
@@ -9,6 +10,9 @@ venv/
 # Ignore common log & temp files
 *.log
 *.sqlite3
+
+# Ignore local databases
+*.db
 
 # Ignore VS Code settings (optional)
 .vscode/

@@ -1,0 +1,7 @@
+flask>=3.0
+pypdf>=4.0
+openai>=1.30
+python-dotenv>=1.0
+
+# Test dependencies
+pytest>=8.0
