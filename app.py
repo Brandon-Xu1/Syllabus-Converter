@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-import re
-from datetime import datetime, date, timedelta
-from typing import List, Dict, Any
-import json
-import os
-import sqlite3
 import hashlib
-from typing import Tuple
+import json
+import logging
+import os
+import re
+import secrets
+import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple
+
 from dotenv import load_dotenv
 
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env or your environment.")
+
+logger = logging.getLogger(__name__)
+
+if not os.getenv("OPENAI_API_KEY"):
+    logger.warning(
+        "OPENAI_API_KEY is not set. Extraction requests will fail until it is "
+        "added to .env or the environment."
+    )
 
 
 from flask import (
@@ -34,7 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover - handled at runtime
     PdfReader = None
 
 app = Flask(__name__)
-app.secret_key = "replace-me"  # simple default; override in production
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 
 # --- Persistence (SQLite) ---
 DB_PATH = os.path.join(os.path.dirname(__file__), "syllabus.db")
@@ -76,6 +83,10 @@ def _init_db():
 _init_db()
 
 
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _get_or_create_visitor_id() -> str:
     vid = request.cookies.get("visitor_id")
     if vid and isinstance(vid, str) and len(vid) <= 64:
@@ -88,8 +99,6 @@ def _ensure_visitor_cookie(resp):
         resp.set_cookie("visitor_id", _get_or_create_visitor_id(), httponly=True, samesite="Lax", max_age=60*60*24*365*2)
     return resp
 
-# Using ChatGPT for extraction; no heuristic diagnostics needed
-
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -99,13 +108,10 @@ def index():
 
     if request.method == "POST":
         uploaded = request.files.get("syllabus")
-        # Persist AI mode preference from the form
-        session["use_ai"] = bool(request.form.get("use_ai"))
         if not uploaded or uploaded.filename == "":
             error = "Please choose a syllabus file to upload."
         else:
             try:
-                semester = (request.form.get("semester") or "").strip() or None
                 year_str = (request.form.get("year") or "").strip()
                 year = int(year_str) if year_str.isdigit() else None
                 sm_str = (request.form.get("start_month") or "").strip()
@@ -114,16 +120,12 @@ def index():
                 end_month = int(em_str) if em_str.isdigit() else None
 
                 text = extract_text(uploaded)
-                print("PDF text chars:", len(text))
-                print("PDF preview:", text[:300].replace("\n"," "))
                 due_dates = extract_due_dates(
                     text,
                     user_year=year,
                     start_month=start_month,
                     end_month=end_month,
-                    use_ai=session.get("use_ai", False),
                 )
-                session["ai_status"] = "active"
                 # Remember user parameters for Save Entry
                 session["term_year"] = year
                 session["start_month"] = start_month
@@ -147,11 +149,12 @@ def index():
             except RuntimeError as exc:
                 error = str(exc)
             except Exception:  # pragma: no cover - generic failure handler
+                logger.exception("Failed to process uploaded syllabus")
                 error = "We couldn't read that file. Make sure it is a standard, text-based PDF."
 
     else:
         # Reset UI to original state on refresh/open by clearing transient session state
-        for key in ("events", "recurring", "use_ai", "ai_status"):
+        for key in ("events", "recurring"):
             session.pop(key, None)
 
     # Only group dated events for monthly view
@@ -162,8 +165,6 @@ def index():
         grouped_events=grouped,
         recurring_items=session.get("recurring", []),
         error=error,
-        use_ai=session.get("use_ai", False),
-        ai_status=session.get("ai_status", "off"),
     )
 
 
@@ -185,14 +186,14 @@ def save_entry():
     recurring_json = json.dumps(recurring or [])
 
     with _db_conn() as conn:
-        cur = conn.execute(
+        conn.execute(
             """
             INSERT INTO saved_entry (visitor_id, created_at, term_year, start_month, end_month, events_json, recurring_json, label)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 visitor_id,
-                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                _utcnow_iso(),
                 term_year,
                 start_month,
                 end_month,
@@ -201,7 +202,6 @@ def save_entry():
                 label,
             ),
         )
-        entry_id = cur.lastrowid
 
     flash("Entry saved.", "info")
     resp = redirect(url_for("history"))
@@ -334,19 +334,64 @@ def extract_text(uploaded_file) -> str:
         pages.append(text)
     return "\n".join(pages)
 
-_URL_RE = re.compile(r'https?://', re.I)
 
-def _has_url(text: str) -> bool:
-    return bool(_URL_RE.search(text))
+# ----- Term-window date logic -----
 
-def _in_plausible_academic_window(d: datetime, base_year: int) -> bool:
-    """Accept only dates near the inferred term (default: same year +/- 1)."""
-    return (base_year - 1) <= d.year <= (base_year + 1)
+_MONTH_NUMBERS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
 
-def _looks_like_historical_year(d: datetime) -> bool:
-    """Hard reject obviously historical years (tune as needed)."""
-    return d.year < 1990
+_MONTH_DAY_RE = re.compile(r"([A-Za-z]+)\.?\s+(\d{1,2})")
 
+
+def window_bounds(start_month: int, end_month: int, year: int) -> Tuple[datetime, datetime]:
+    """Return inclusive datetime bounds for a term window.
+
+    A window whose end month precedes its start month (e.g. August-January)
+    wraps into the following year.
+    """
+    start = datetime(year, start_month, 1)
+    end_year = year + 1 if end_month < start_month else year
+    if end_month == 12:
+        end = datetime(end_year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end = datetime(end_year, end_month + 1, 1) - timedelta(days=1)
+    return start, end
+
+
+def in_window(d: datetime, start: datetime, end: datetime) -> bool:
+    return start <= d <= end
+
+
+def resolve_date_str(text: str, start_month: int, end_month: int, year: int) -> datetime | None:
+    """Resolve a month-name/day string (e.g. "Jan 6") against a term window.
+
+    In a wrapped window (August-January), months before the start month
+    resolve to the following year. Invalid dates (e.g. "Feb 30") return None.
+    """
+    m = _MONTH_DAY_RE.search(text)
+    if not m:
+        return None
+    month = _MONTH_NUMBERS.get(m.group(1).lower())
+    if month is None:
+        return None
+    day = int(m.group(2))
+    resolved_year = year + 1 if end_month < start_month and month < start_month else year
+    try:
+        return datetime(resolved_year, month, day)
+    except ValueError:
+        return None
 
 
 def extract_due_dates(
@@ -354,17 +399,13 @@ def extract_due_dates(
     user_year: int | None = None,
     start_month: int | None = None,
     end_month: int | None = None,
-    use_ai: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Use ChatGPT to extract due dates and recurring items from the syllabus text.
+    """Use the LLM to extract due dates and recurring items from the syllabus text.
 
     Returns a list of dicts with keys:
       - "date": datetime | None
       - "description": str
     """
-    # Debug: ensure PDF gave us real text
-    print("PDF text chars:", len(text))
-
     # Build a recall-first candidate text and use chunking + cache-aware extraction
     candidate = build_candidate_text(text)
     # If the candidate is too small, fallback to full text to avoid missing anything
@@ -377,10 +418,16 @@ def extract_due_dates(
             "year": user_year,
             "start_month": start_month,
             "end_month": end_month,
-            "use_ai": bool(use_ai),
         },
     )
     events: List[Dict[str, Any]] = []
+
+    window_wraps = (
+        start_month is not None and end_month is not None and end_month < start_month
+    )
+    bounds = None
+    if user_year is not None and start_month is not None and end_month is not None:
+        bounds = window_bounds(start_month, end_month, user_year)
 
     for item in raw_items:
         title = str(item.get("title", "")).strip() or "Due"
@@ -393,17 +440,24 @@ def extract_due_dates(
         if isinstance(due_date_val, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date_val.strip()):
             try:
                 dt = datetime.strptime(due_date_val.strip(), "%Y-%m-%d")
-                # Enforce authoritative user_year if provided
-                if user_year is not None:
-                    try:
-                        dt = dt.replace(year=user_year)
-                    except ValueError:
-                        # Invalid date in target year (e.g., Feb 29 on non-leap year)
-                        continue
-                events.append({"date": dt, "description": f"{title}: {description}"})
             except Exception:
                 # Skip invalid date strings
                 continue
+            # Enforce authoritative user_year if provided; in a wrapped window
+            # (e.g. Aug-Jan), months before the start month belong to the next year.
+            if user_year is not None:
+                target_year = user_year
+                if window_wraps and dt.month < start_month:
+                    target_year = user_year + 1
+                try:
+                    dt = dt.replace(year=target_year)
+                except ValueError:
+                    # Invalid date in target year (e.g., Feb 29 on non-leap year)
+                    continue
+            # Drop dates outside the user-selected term window
+            if bounds is not None and not in_window(dt, *bounds):
+                continue
+            events.append({"date": dt, "description": f"{title}: {description}"})
         else:
             # No explicit date. If recurrence exists, keep as undated recurring item.
             rec_str = (str(recurrence_val).strip() if recurrence_val is not None else "")
@@ -427,95 +481,8 @@ def extract_due_dates(
         seen.add(sig)
         unique.append(e)
 
-    print("Events kept:", len(unique))
+    logger.debug("Events kept: %d", len(unique))
     return unique
-
-
-
-
-
-
-
-
-# (legacy date token finder removed)
-
-
-# (legacy date token parser removed)
-
-
-# (legacy token stripping removed)
-
-
-# (legacy helper removed)
-
-
-# ----- Heuristic and optional-AI classification to filter out non-deadlines -----
-
-_POSITIVE_KEYWORDS = [
-    "due",
-    "deadline",
-    "submit",
-    "submission",
-    "turn in",
-    "upload",
-    "deliver",
-    "deliverable",
-    "exam",
-    "test",
-    "quiz",
-    "midterm",
-    "final",
-    "assignment",
-    "homework",
-    "hw",
-    "project",
-    "paper",
-    "essay",
-    "lab",
-    "report",
-    "proposal",
-    "draft",
-    "milestone",
-    "checkpoint",
-    "presentation",
-    "gradescope",
-    "canvas",
-    "turnitin",
-]
-
-_NEGATIVE_KEYWORDS = [
-    "published",
-    "accessed",
-    "retrieved",
-    "copyright",
-    "isbn",
-    "doi",
-    "pp.",
-    "vol.",
-    "no.",
-    "edition",
-    "ed.",
-    "eds.",
-    "press",
-    "journal",
-    "proceedings",
-    "conference",
-    "arxiv",
-    "url",
-    "http",
-    "https",
-    "university press",
-    "oxford",
-    "cambridge",
-    "springer",
-    "wiley",
-    "sage",
-    "financial times",
-    "new york times",
-    "washington post",
-    "wall street journal",
-]
-
 
 
 def add_calendar_links(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -558,7 +525,7 @@ def build_ics(events: List[Dict[str, Any]]) -> str:
             [
                 "BEGIN:VEVENT",
                 f"UID:{uid}",
-                f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
+                f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
                 f"DTSTART;VALUE=DATE:{date}",
                 f"DTEND;VALUE=DATE:{end_date}",
                 f"SUMMARY:{description}",
@@ -571,10 +538,6 @@ def build_ics(events: List[Dict[str, Any]]) -> str:
 
 def _escape_ics_text(value: str) -> str:
     return value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-
-
-if __name__ == "__main__":
-    pass
 
 
 DATE_WORDS = r"""
@@ -643,20 +606,6 @@ def _extract_with_chatgpt(
     user_year: int | None = None,
     cache_params: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception:
-        print("openai SDK not installed")
-        return []
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("No OPENAI_API_KEY in env")
-        return []
-
-    client = OpenAI(api_key=api_key)
-    model = os.environ.get("OPENAI_DEADLINE_MODEL", "gpt-4o-mini")
-
     params = cache_params or {}
     key_basis = json.dumps({"text": text, "params": params, "year": user_year}, ensure_ascii=False, sort_keys=True)
     cache_key = hashlib.sha256(key_basis.encode("utf-8")).hexdigest()
@@ -668,6 +617,18 @@ def _extract_with_chatgpt(
             return json.loads(row[0])
         except Exception:
             pass
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("The 'openai' package is not installed: pip install openai") from exc
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env or your environment.")
+
+    client = OpenAI(api_key=api_key)
+    model = os.environ.get("OPENAI_DEADLINE_MODEL", "gpt-4o-mini")
 
     max_chars = int(os.environ.get("SYLLABUS_MAX_CHARS", "24000"))
     chunks = [text] if len(text) <= max_chars else [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
@@ -684,8 +645,6 @@ def _extract_with_chatgpt(
     merged: List[Dict[str, Any]] = []
 
     for chunk in chunks:
-        snippet = chunk  # NOW snippet exists
-
         user = (
             "Extract graded deadlines from this syllabus.\n\n"
             f"User-selected academic year: {target_year} (authoritative; override conflicting years in text).\n\n"
@@ -696,7 +655,7 @@ def _extract_with_chatgpt(
             "- Recurring without explicit date => due_date=null and recurrence filled.\n\n"
             "Schema per item:\n"
             '{ "title": string, "due_date": "YYYY-MM-DD" | null, "recurrence": string | null, "description": string }\n\n'
-            f"Syllabus text:\n```\n{snippet}\n```"
+            f"Syllabus text:\n```\n{chunk}\n```"
         )
 
         resp = client.chat.completions.create(
@@ -745,7 +704,7 @@ def _extract_with_chatgpt(
             "INSERT OR REPLACE INTO extraction_cache (cache_key, created_at, params_json, text_len, events_json) VALUES (?, ?, ?, ?, ?)",
             (
                 cache_key,
-                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                _utcnow_iso(),
                 json.dumps(params, sort_keys=True),
                 len(text),
                 json.dumps(result),
@@ -753,7 +712,6 @@ def _extract_with_chatgpt(
         )
 
     return result
-
 
 
 def split_events(events: List[Dict[str, Any]]):
@@ -769,3 +727,7 @@ def split_events(events: List[Dict[str, Any]]):
         else:
             dated.append(e)
     return dated, recurring
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
