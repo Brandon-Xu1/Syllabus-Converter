@@ -1,3 +1,5 @@
+import io
+import json
 from datetime import datetime
 
 import app as app_module
@@ -5,12 +7,14 @@ from app import (
     build_candidate_text,
     build_ics,
     extract_due_dates,
+    extract_text,
     split_events,
+    _parse_llm_content,
 )
 
 
 def _fake_llm(items):
-    def fake(text, user_year=None, cache_params=None):
+    def fake(text, user_year=None, cache_params=None, refresh_cache=False):
         return items
     return fake
 
@@ -67,6 +71,38 @@ def test_candidate_text_selects_deadline_lines_from_large_text():
     assert candidate != text
     assert "Assignment 3 due" in candidate
     assert "xxxx yyyy zzzz 50" not in candidate
+
+
+def test_parse_llm_content_variants():
+    items = [{"title": "HW", "due_date": "2025-09-10", "recurrence": None, "description": "hw"}]
+    arr = json.dumps(items)
+    assert _parse_llm_content(json.dumps({"items": items})) == items
+    assert _parse_llm_content(arr) == items
+    assert _parse_llm_content(f"```json\n{arr}\n```") == items
+    assert _parse_llm_content("Sure! Here you go: " + arr) == items
+    assert _parse_llm_content("no json here") == []
+    assert _parse_llm_content("") == []
+
+
+def test_docx_extraction():
+    import docx as docx_lib
+
+    buf = io.BytesIO()
+    document = docx_lib.Document()
+    document.add_paragraph("Homework 1 due September 10")
+    table = document.add_table(rows=1, cols=2)
+    table.rows[0].cells[0].text = "Final exam"
+    table.rows[0].cells[1].text = "December 12"
+    document.save(buf)
+    buf.seek(0)
+
+    class Upload:
+        filename = "syllabus.docx"
+        stream = buf
+
+    text = extract_text(Upload())
+    assert "Homework 1 due September 10" in text
+    assert "Final exam | December 12" in text
 
 
 def test_build_ics_escapes_and_formats():

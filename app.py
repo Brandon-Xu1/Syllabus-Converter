@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -34,17 +35,39 @@ from flask import (
     flash,
     make_response,
 )
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 try:
     from pypdf import PdfReader  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - handled at runtime
     PdfReader = None
 
+try:
+    import docx  # type: ignore - python-docx
+except ModuleNotFoundError:  # pragma: no cover - handled at runtime
+    docx = None
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "10")) * 1024 * 1024
+app.config["EXTRACT_RATE_LIMIT"] = os.environ.get("EXTRACT_RATE_LIMIT", "20 per hour")
+
+# Trust X-Forwarded-* headers when running behind a reverse proxy (Render, Railway, ...)
+# so rate limiting sees the real client IP instead of the proxy's.
+if os.environ.get("TRUST_PROXY") or os.environ.get("RENDER") or os.environ.get("RAILWAY_ENVIRONMENT"):
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
+)
 
 # --- Persistence (SQLite) ---
-DB_PATH = os.path.join(os.path.dirname(__file__), "syllabus.db")
+DB_PATH = os.environ.get("SYLLABUS_DB_PATH") or os.path.join(os.path.dirname(__file__), "syllabus.db")
 
 def _db_conn():
     return sqlite3.connect(DB_PATH)
@@ -101,6 +124,7 @@ def _ensure_visitor_cookie(resp):
 
 
 @app.route("/", methods=["GET", "POST"])
+@limiter.limit(lambda: app.config["EXTRACT_RATE_LIMIT"], methods=["POST"])
 def index():
     error = None
     events: List[Dict[str, Any]] = []
@@ -314,14 +338,41 @@ def download_ics():
     return response
 
 
+@app.errorhandler(413)
+def _file_too_large(_e):
+    # Don't render index.html here: it reads request.form, which would re-parse
+    # the oversized body and re-raise the 413 inside this handler.
+    max_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    flash(f"File too large. The maximum upload size is {max_mb} MB.", "error")
+    return redirect(url_for("index"))
+
+
+@app.errorhandler(429)
+def _rate_limited(e):
+    return render_template(
+        "index.html",
+        grouped_events={},
+        recurring_items=[],
+        error=f"Too many extraction requests ({e.description}). Please try again later.",
+    ), 429
+
+
+# Scanned PDFs yield little or no text from the text layer; below this
+# threshold we attempt OCR instead.
+_OCR_MIN_TEXT_CHARS = 100
+
+
 def extract_text(uploaded_file) -> str:
-    """Extract raw text from an uploaded PDF or text file."""
+    """Extract raw text from an uploaded PDF, DOCX, or text file."""
     filename = uploaded_file.filename.lower()
     if filename.endswith(".txt"):
         return uploaded_file.read().decode("utf-8", errors="ignore")
 
+    if filename.endswith(".docx"):
+        return _extract_docx_text(uploaded_file.stream)
+
     if not filename.endswith(".pdf"):
-        raise RuntimeError("Please upload a PDF or plain text file.")
+        raise RuntimeError("Please upload a PDF, DOCX, or plain text file.")
 
     if PdfReader is None:
         raise RuntimeError("Install the 'pypdf' package to enable PDF parsing: pip install pypdf")
@@ -332,7 +383,46 @@ def extract_text(uploaded_file) -> str:
     for page in reader.pages:
         text = page.extract_text() or ""
         pages.append(text)
-    return "\n".join(pages)
+    text = "\n".join(pages)
+
+    if len(text.strip()) < _OCR_MIN_TEXT_CHARS:
+        ocr_text = _ocr_pdf_text(uploaded_file.stream)
+        if ocr_text.strip():
+            logger.info("PDF text layer was empty; used OCR fallback (%d chars)", len(ocr_text))
+            return ocr_text
+        raise RuntimeError(
+            "This PDF has no extractable text (it may be scanned). "
+            "Enable OCR support (see README) or upload a text-based export."
+        )
+    return text
+
+
+def _extract_docx_text(stream) -> str:
+    if docx is None:
+        raise RuntimeError("Install the 'python-docx' package to enable DOCX parsing: pip install python-docx")
+    stream.seek(0)
+    document = docx.Document(stream)
+    parts = [p.text for p in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
+    return "\n".join(parts)
+
+
+def _ocr_pdf_text(stream) -> str:
+    """OCR a PDF via pdf2image + pytesseract. Returns "" if OCR is unavailable."""
+    try:
+        import pytesseract  # type: ignore
+        from pdf2image import convert_from_bytes  # type: ignore
+    except Exception:
+        return ""
+    try:
+        stream.seek(0)
+        images = convert_from_bytes(stream.read())
+        return "\n".join(pytesseract.image_to_string(image) for image in images)
+    except Exception:
+        logger.exception("OCR fallback failed")
+        return ""
 
 
 # ----- Term-window date logic -----
@@ -399,6 +489,7 @@ def extract_due_dates(
     user_year: int | None = None,
     start_month: int | None = None,
     end_month: int | None = None,
+    refresh_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     """Use the LLM to extract due dates and recurring items from the syllabus text.
 
@@ -410,6 +501,13 @@ def extract_due_dates(
     candidate = build_candidate_text(text)
     # If the candidate is too small, fallback to full text to avoid missing anything
     snippet = text if len(candidate) < 1500 else candidate
+    if text:
+        logger.info(
+            "Candidate selection: %d -> %d chars (%.0f%% reduction)",
+            len(text),
+            len(snippet),
+            100.0 * (1 - len(snippet) / len(text)),
+        )
 
     raw_items = _extract_with_chatgpt(
         snippet,
@@ -419,6 +517,7 @@ def extract_due_dates(
             "start_month": start_month,
             "end_month": end_month,
         },
+        refresh_cache=refresh_cache,
     )
     events: List[Dict[str, Any]] = []
 
@@ -601,22 +700,110 @@ def build_candidate_text(full_text: str) -> str:
     return candidate if len(candidate) >= 1500 else full_text
 
 
+# Strict JSON Schema for OpenAI structured outputs: the model is constrained to
+# return {"items": [...]} matching this shape, eliminating free-form JSON parsing.
+_EXTRACTION_SCHEMA = {
+    "name": "syllabus_deadlines",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "due_date": {
+                            "type": ["string", "null"],
+                            "description": "Explicit date from the text as YYYY-MM-DD, else null",
+                        },
+                        "recurrence": {"type": ["string", "null"]},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["title", "due_date", "recurrence", "description"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _call_llm(client, model: str, system: str, user: str) -> str:
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0,
+            response_format={"type": "json_schema", "json_schema": _EXTRACTION_SCHEMA},
+        )
+    except TypeError:
+        # SDK too old to know response_format
+        logger.warning("Structured outputs unavailable in this SDK; falling back to free-form JSON")
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=0)
+    except Exception as exc:
+        # Models without structured-output support reject the request
+        if type(exc).__name__ != "BadRequestError":
+            raise
+        logger.warning("Model %s rejected structured outputs; falling back to free-form JSON", model)
+        resp = client.chat.completions.create(model=model, messages=messages, temperature=0)
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _parse_llm_content(content: str) -> List[Dict[str, Any]]:
+    """Parse LLM output into a list of item dicts.
+
+    Handles the structured-output object form ({"items": [...]}), a bare JSON
+    array, fenced code blocks, and JSON embedded in prose. Returns [] on garbage.
+    """
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?", "", content).strip()
+        if content.endswith("```"):
+            content = content[:-3].strip()
+
+    try:
+        data = json.loads(content)
+    except Exception:
+        m = re.search(r"\[.*\]", content, flags=re.S)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return []
+
+    if isinstance(data, dict):
+        data = data.get("items", [])
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    return []
+
+
 def _extract_with_chatgpt(
     text: str,
     user_year: int | None = None,
     cache_params: Dict[str, Any] | None = None,
+    refresh_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     params = cache_params or {}
     key_basis = json.dumps({"text": text, "params": params, "year": user_year}, ensure_ascii=False, sort_keys=True)
     cache_key = hashlib.sha256(key_basis.encode("utf-8")).hexdigest()
 
-    with _db_conn() as conn:
-        row = conn.execute("SELECT events_json FROM extraction_cache WHERE cache_key=?", (cache_key,)).fetchone()
-    if row:
-        try:
-            return json.loads(row[0])
-        except Exception:
-            pass
+    if not refresh_cache:
+        with _db_conn() as conn:
+            row = conn.execute("SELECT events_json FROM extraction_cache WHERE cache_key=?", (cache_key,)).fetchone()
+        if row:
+            try:
+                result = json.loads(row[0])
+                logger.info("Extraction cache hit (%s…)", cache_key[:12])
+                return result
+            except Exception:
+                pass
 
     try:
         from openai import OpenAI  # type: ignore
@@ -636,20 +823,22 @@ def _extract_with_chatgpt(
     target_year = str(user_year) if user_year is not None else "UNKNOWN"
 
     system = (
-        "You extract graded deadlines and due dates. Output ONLY valid JSON (no prose). "
+        "You extract graded deadlines and due dates. "
+        'Output ONLY a valid JSON object of the form { "items": [ ... ] } (no prose). '
         "Never infer or guess calendar dates from month headers, semester ranges, or context. "
         "Only include a due_date if there is an explicit date string present in the text. "
         "If an item is recurring and no explicit calendar date is given, set due_date to null and include recurrence."
     )
 
     merged: List[Dict[str, Any]] = []
+    t0 = time.perf_counter()
 
     for chunk in chunks:
         user = (
             "Extract graded deadlines from this syllabus.\n\n"
             f"User-selected academic year: {target_year} (authoritative; override conflicting years in text).\n\n"
             "Rules:\n"
-            "- Output ONLY valid JSON.\n"
+            '- Output ONLY a valid JSON object: { "items": [ ... ] }.\n'
             f"- If user-selected year is {target_year}, normalize dates to that year when month/day are explicit.\n"
             "- Never invent missing month/day.\n"
             "- Recurring without explicit date => due_date=null and recurrence filled.\n\n"
@@ -658,29 +847,13 @@ def _extract_with_chatgpt(
             f"Syllabus text:\n```\n{chunk}\n```"
         )
 
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0,
-        )
+        content = _call_llm(client, model, system, user)
+        merged.extend(_parse_llm_content(content))
 
-        content = (resp.choices[0].message.content or "").strip()
-
-        if content.startswith("```"):
-            content = re.sub(r"^```(?:json)?", "", content).strip()
-            if content.endswith("```"):
-                content = content[:-3].strip()
-
-        try:
-            data = json.loads(content)
-        except Exception:
-            m = re.search(r"\[.*\]", content, flags=re.S)
-            if not m:
-                continue
-            data = json.loads(m.group(0))
-
-        if isinstance(data, list):
-            merged.extend([d for d in data if isinstance(d, dict)])
+    logger.info(
+        "LLM extraction: %d chunk(s), %d chars in %.2fs (model=%s)",
+        len(chunks), len(text), time.perf_counter() - t0, model,
+    )
 
     # dedupe
     seen = set()

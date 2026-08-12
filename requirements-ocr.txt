@@ -1,0 +1,6 @@
+# Optional OCR support for scanned (image-only) PDFs.
+# Also requires system packages: tesseract-ocr and poppler.
+#   macOS:  brew install tesseract poppler
+#   Debian: apt-get install tesseract-ocr poppler-utils
+pytesseract>=0.3.10
+pdf2image>=1.17

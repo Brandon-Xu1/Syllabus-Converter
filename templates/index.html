@@ -10,7 +10,7 @@
     <main class="container">
         <header>
             <h1>MySyllabus</h1>
-            <p>Upload a PDF or text file and we will pull out the due dates for you.</p>
+            <p>Upload a PDF, DOCX, or text file and we will pull out the due dates for you.</p>
         </header>
         {% if error %}
             <div class="alert alert-error">{{ error }}</div>
@@ -25,9 +25,9 @@
         <section class="upload">
             <form id="syllabus-form" method="post" enctype="multipart/form-data">
                 <div class="file-control">
-                    <label for="syllabus">Choose a file (PDF or TXT)</label>
+                    <label for="syllabus">Choose a file (PDF, DOCX, or TXT)</label>
                     <span id="syllabus-file-name" class="file-name" aria-live="polite">No file chosen</span>
-                    <input type="file" id="syllabus" name="syllabus" accept=".pdf,.txt" required>
+                    <input type="file" id="syllabus" name="syllabus" accept=".pdf,.docx,.txt" required>
                 </div>
                 <label>Term:</label>
                 <select name="semester" id="semester">
